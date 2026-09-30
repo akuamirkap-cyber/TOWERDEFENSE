@@ -6,7 +6,8 @@ import { FlameSystem } from "./FlameSystem";
 import { MarineVisualSystem, type MarinePose } from "./MarineVisualSystem";
 import { OrcRunnerSystem, runCycle } from "./OrcRunnerSystem";
 import { RagdollSystem } from "./RagdollSystem";
-import { createRaidLanes, ENTRY_ORDER, isValidRaidLanes, MAP_HALF_X, MAP_HALF_Z, trackName, VISUAL_HALF_X, VISUAL_HALF_Z, type RaidLane } from "./TrackGenerator";
+import { createRaidLanes, createDecorRoads, ENTRY_ORDER, isValidRaidLanes, MAP_HALF_X, MAP_HALF_Z, FORTRESS_X, trackName, VISUAL_HALF_X, VISUAL_HALF_Z, type RaidLane } from "./TrackGenerator";
+import { loadSvgMap, buildLanesFromWalls, gridBlocked, gridCollideBox, gridIsWall, segmentHitsWall, type CollisionGrid } from "./SvgMapSystem";
 import { WeatherSystem } from "./WeatherSystem";
 import {
   ABILITIES,
@@ -65,6 +66,8 @@ interface Enemy {
   shockSparkTimer: number;
   isHulk?: boolean;
   isSuperHulk?: boolean;
+  safeX?: number; // posisi aman frame lalu (anti-terowongan tembok PNG)
+  safeZ?: number;
 }
 
 interface Corpse {
@@ -87,6 +90,8 @@ interface Corpse {
   landed: boolean;
   distance: number;
   lostParts: number;
+  safeX?: number;
+  safeZ?: number;
 }
 
 interface RifleShot {
@@ -274,12 +279,16 @@ interface DirectorSettings {
 const STORAGE_KEY = "orc-problem-webgl-save-v1";
 const DIRECTOR_STORAGE_KEY = "orc-problem-director-v1";
 const TRACK_STORAGE_KEY = "orc-problem-track-v2";
+const SVG_STORAGE_KEY = "orc-problem-svgmap-v1";
+const SVG_MAX_DATAURL = 2_600_000;
 const MAX_ORCS = 14000;
 const MAX_CORPSES = 800;
 const MAX_BLOOD = 1500;
 const MAX_SPLATS = 2500;
 const PATH_STEPS = 360;
 const LANE_HALF_WIDTH = 4.1;
+// Warna jalan bergaya labirin abu-abu (fringe rumput, bibir jalan, permukaan, garis tepi).
+const ROAD_COLORS = [0x4d6a40, 0x81878d, 0xb6bbbf, 0x8a9096, 0x8a9096, 0x676d73, 0x676d73];
 const MAX_SHOT_PARTICLES = 700;
 const MAX_HIT_FLASHES = 1000;
 const MAX_RIFLE_SHOTS = 320;
@@ -385,9 +394,12 @@ function loadTrackState(): { seed: number; lanes: RaidLane[] | null } {
     const stored = localStorage.getItem(TRACK_STORAGE_KEY);
     if (stored) {
       const parsed = JSON.parse(stored) as { seed?: unknown; lanes?: unknown };
-      if (Number.isSafeInteger(parsed.seed) && Number(parsed.seed) > 0 && Number(parsed.seed) <= 999999 &&
-        isValidRaidLanes(parsed.lanes)) {
-        return { seed: Number(parsed.seed), lanes: parsed.lanes };
+      const seed = Number(parsed.seed);
+      if (Number.isSafeInteger(seed) && seed > 0 && seed <= 999999) {
+        // Simpanan berformat lama (4 penjuru) ditolak — seed-nya tetap dipakai untuk
+        // membuat labirin barat->timur yang baru.
+        if (isValidRaidLanes(parsed.lanes)) return { seed, lanes: parsed.lanes };
+        return { seed, lanes: null };
       }
     }
     const legacy = localStorage.getItem("orc-problem-track-v1");
@@ -432,6 +444,17 @@ export class GameEngine {
   private pathLengths: number[] = [];
   private pathLength = 1;
   private lanes: RaidLane[] = [];
+  private decorRoads: PathSample[][] = [];
+  private svgDataUrl: string | null = null;
+  private svgLanes: RaidLane[] | null = null;
+  private svgGrid: CollisionGrid | null = null;
+  private svgImage: HTMLImageElement | null = null;
+  private svgRotation = 0;
+  private terrainCtx: CanvasRenderingContext2D | null = null;
+  // Ukuran arena aktif: mengikuti aspek PNG saat peta gambar dipasang.
+  private arenaHalfX = MAP_HALF_X;
+  private arenaHalfZ = MAP_HALF_Z;
+  private fortressX = FORTRESS_X;
   private terrainObstacles: TerrainObstacle[] = [];
   private roadVisuals: THREE.Mesh[] = [];
   private decorationVisuals: THREE.InstancedMesh[] = [];
@@ -553,7 +576,7 @@ export class GameEngine {
     this.renderer.domElement.className = "battle-canvas";
     this.renderer.domElement.style.touchAction = "none";
     this.renderer.domElement.title = "Scroll untuk zoom, drag untuk geser peta, klik untuk beraksi";
-    this.renderer.domElement.setAttribute("aria-label", "Medan perang 3D dengan empat jalur serangan. Scroll untuk zoom dan drag untuk menggeser kamera.");
+    this.renderer.domElement.setAttribute("aria-label", "Medan perang 3D dengan empat jalur serangan dari barat ke timur. Scroll untuk zoom dan drag untuk menggeser kamera.");
     this.container.appendChild(this.renderer.domElement);
 
     this.camera.zoom = window.innerWidth < 650 ? 1.14 : 1;
@@ -598,6 +621,20 @@ export class GameEngine {
     this.updateOrcInstances();
     this.emit();
     this.renderer.setAnimationLoop(this.animate);
+
+    // Peta SVG tersimpan dari sesi sebelumnya dimuat kembali (fase masih build).
+    try {
+      const raw = localStorage.getItem(SVG_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as { data?: unknown; rotation?: unknown };
+        if (typeof parsed.data === "string" && parsed.data.startsWith("data:image/") && parsed.data.length <= SVG_MAX_DATAURL) {
+          const rotation = typeof parsed.rotation === "number" && [0, 90, 180, 270].includes(parsed.rotation) ? parsed.rotation : 0;
+          void this.applySvgMap(parsed.data, rotation);
+        }
+      }
+    } catch {
+      // Simpanan rusak diabaikan; peta prosedural tetap jalan.
+    }
   }
 
   private get maxHp() {
@@ -644,7 +681,9 @@ export class GameEngine {
       wave: this.wave,
       bestWave: this.progress.bestWave,
       trackSeed: this.trackSeed,
-      trackName: trackName(this.trackSeed),
+      trackName: this.svgDataUrl ? "PETA SVG" : trackName(this.trackSeed),
+      svgMap: this.svgDataUrl !== null,
+      svgRotation: this.svgRotation,
       trackLength: this.pathLength,
       weather: this.weather.mode,
       cameraZoom: this.camera.zoom,
@@ -722,8 +761,8 @@ export class GameEngine {
     const halfWidth = (this.camera.right - this.camera.left) / (2 * this.camera.zoom);
     const halfHeight = (this.camera.top - this.camera.bottom) / (2 * this.camera.zoom);
     const groundProjection = this.cameraOffset.y / this.cameraOffset.length();
-    this.cameraTarget.x = clamp(this.cameraTarget.x, -Math.max(0, MAP_HALF_X - halfWidth + 6), Math.max(0, MAP_HALF_X - halfWidth + 6));
-    this.cameraTarget.z = clamp(this.cameraTarget.z, -Math.max(0, MAP_HALF_Z - halfHeight / groundProjection + 6), Math.max(0, MAP_HALF_Z - halfHeight / groundProjection + 6));
+    this.cameraTarget.x = clamp(this.cameraTarget.x, -Math.max(0, this.arenaHalfX - halfWidth + 6), Math.max(0, this.arenaHalfX - halfWidth + 6));
+    this.cameraTarget.z = clamp(this.cameraTarget.z, -Math.max(0, this.arenaHalfZ - halfHeight / groundProjection + 6), Math.max(0, this.arenaHalfZ - halfHeight / groundProjection + 6));
   }
 
   private createPath() {
@@ -731,27 +770,35 @@ export class GameEngine {
     this.paths = [];
     this.pathLengths = [];
     for (const lane of this.lanes) {
-      const curve = new THREE.CatmullRomCurve3(
-        lane.controls.map(([x, z]) => new THREE.Vector3(x, 0, z)),
-        false,
-        "catmullrom",
-        0.22,
-      );
-      this.pathLengths.push(curve.getLength());
-      const points = curve.getSpacedPoints(PATH_STEPS);
-      this.paths.push(points.map((point, index) => {
-        const previous = points[Math.max(0, index - 1)];
-        const next = points[Math.min(PATH_STEPS, index + 1)];
-        const dx = next.x - previous.x;
-        const dz = next.z - previous.z;
-        const length = Math.hypot(dx, dz) || 1;
-        return { x: point.x, z: point.z, nx: -dz / length, nz: dx / length };
-      }));
+      const built = this.sampleCurve(lane.controls);
+      this.pathLengths.push(built.length);
+      this.paths.push(built.samples);
     }
     this.pathLength = this.pathLengths.reduce((sum, length) => sum + length, 0);
+    this.decorRoads = this.svgLanes ? [] : createDecorRoads(this.trackSeed, this.lanes).map((controls) => this.sampleCurve(controls).samples);
   }
 
-  private createRibbon(samples: PathSample[], width: number, color: number, height: number, offset = 0, opacity = 1) {
+  private sampleCurve(controls: readonly (readonly [number, number])[]) {
+    const curve = new THREE.CatmullRomCurve3(
+      controls.map(([x, z]) => new THREE.Vector3(x, 0, z)),
+      false,
+      "catmullrom",
+      0.22,
+    );
+    const length = curve.getLength();
+    const points = curve.getSpacedPoints(PATH_STEPS);
+    const samples = points.map((point, index) => {
+      const previous = points[Math.max(0, index - 1)];
+      const next = points[Math.min(points.length - 1, index + 1)];
+      const dx = next.x - previous.x;
+      const dz = next.z - previous.z;
+      const len = Math.hypot(dx, dz) || 1;
+      return { x: point.x, z: point.z, nx: -dz / len, nz: dx / len };
+    });
+    return { samples, length };
+  }
+
+  private createRibbon(samples: PathSample[], width: number, color: number, height: number, offset = 0, opacity = 1, role = 0) {
     const vertices: number[] = [];
     const indices: number[] = [];
     for (let index = 0; index < samples.length; index++) {
@@ -779,6 +826,7 @@ export class GameEngine {
       depthWrite: opacity === 1,
     });
     const visual = new THREE.Mesh(geometry, material);
+    visual.userData.role = role;
     this.scene.add(visual);
     this.roadVisuals.push(visual);
   }
@@ -790,28 +838,41 @@ export class GameEngine {
       (mesh.material as THREE.Material).dispose();
     }
     this.roadVisuals = [];
-    this.paths.forEach((samples, lane) => {
+    // Peta PNG: gambar penanda tepi jalan saja supaya batas area laluan orc
+    // (termasuk jalan paksa hasil carve) terlihat jelas di atas terrain.
+    if (this.svgLanes) {
+      this.paths.forEach((samples, lane) => {
+        const layer = lane * 0.002;
+        this.createRibbon(samples, 0.67, ROAD_COLORS[5], 0.045 + layer, -5.0, 0.85, 5);
+        this.createRibbon(samples, 0.67, ROAD_COLORS[5], 0.045 + layer, 5.0, 0.85, 6);
+      });
+    } else this.paths.forEach((samples, lane) => {
       const layer = lane * 0.002;
-      this.createRibbon(samples, 12.3, 0x4c6e3f, -0.055 + layer);
-      this.createRibbon(samples, 9.9, 0x9c8252, -0.025 + layer);
-      this.createRibbon(samples, 9.1, 0xb9a173, 0.005 + layer);
-      this.createRibbon(samples, 0.22, 0x806e4d, 0.023 + layer, -2.4, 0.49);
-      this.createRibbon(samples, 0.22, 0x806e4d, 0.023 + layer, 2.4, 0.49);
-      this.createRibbon(samples, 0.67, 0x49663b, 0.045 + layer, -5.0);
-      this.createRibbon(samples, 0.67, 0x49663b, 0.045 + layer, 5.0);
+      this.createRibbon(samples, 12.3, ROAD_COLORS[0], -0.055 + layer, 0, 1, 0);
+      this.createRibbon(samples, 9.9, ROAD_COLORS[1], -0.025 + layer, 0, 1, 1);
+      this.createRibbon(samples, 9.1, ROAD_COLORS[2], 0.005 + layer, 0, 1, 2);
+      this.createRibbon(samples, 0.67, ROAD_COLORS[5], 0.045 + layer, -5.0, 1, 5);
+      this.createRibbon(samples, 0.67, ROAD_COLORS[5], 0.045 + layer, 5.0, 1, 6);
+    });
+    // Jalan labirin dekoratif (buntu) — hanya hiasan, orc tidak melewatinya.
+    this.decorRoads.forEach((samples, index) => {
+      const layer = -0.01 - index * 0.0015;
+      this.createRibbon(samples, 12.3, ROAD_COLORS[0], -0.055 + layer, 0, 1, 0);
+      this.createRibbon(samples, 9.9, ROAD_COLORS[1], -0.025 + layer, 0, 1, 1);
+      this.createRibbon(samples, 9.1, ROAD_COLORS[2], 0.005 + layer, 0, 1, 2);
     });
     if (this.weather) this.applyWeatherToRoad();
   }
 
   private applyWeatherToRoad() {
     const colors = this.weather.mode === "snow"
-      ? [0xa7c0bb, 0x9aa9a0, 0xcddbd5, 0xa9b9b3, 0xa9b9b3, 0xe1eef1, 0xe1eef1]
+      ? [0x9fb5aa, 0x8fa09f, 0xc9d8d3, 0xa9b9b3, 0xa9b9b3, 0xe1eef1, 0xe1eef1]
       : this.weather.mode === "rainyNight"
-        ? [0x253c37, 0x415057, 0x57676b, 0x394d52, 0x394d52, 0x254049, 0x254049]
-        : [0x4c6e3f, 0x9c8252, 0xb9a173, 0x806e4d, 0x806e4d, 0x49663b, 0x49663b];
-    for (let index = 0; index < this.roadVisuals.length; index++) {
-      const material = this.roadVisuals[index].material as THREE.MeshLambertMaterial;
-      material.color.setHex(colors[index % 7]);
+        ? [0x2b4034, 0x3a4a51, 0x506066, 0x394d52, 0x394d52, 0x254049, 0x254049]
+        : ROAD_COLORS;
+    for (const mesh of this.roadVisuals) {
+      const role = typeof mesh.userData.role === "number" ? mesh.userData.role : 0;
+      (mesh.material as THREE.MeshLambertMaterial).color.setHex(colors[role] ?? colors[0]);
     }
   }
 
@@ -819,25 +880,8 @@ export class GameEngine {
     const canvas = document.createElement("canvas");
     canvas.width = 768;
     canvas.height = 768;
-    const ctx = canvas.getContext("2d")!;
-    const random = randomGenerator(2917);
-    ctx.fillStyle = "#66874b";
-    ctx.fillRect(0, 0, 768, 768);
-
-    for (let index = 0; index < 700; index++) {
-      const x = random() * 768;
-      const y = random() * 768;
-      const radius = 8 + random() * 36;
-      ctx.fillStyle = random() > 0.5 ? "rgba(23,70,34,0.055)" : "rgba(218,205,117,0.07)";
-      ctx.beginPath();
-      ctx.ellipse(x, y, radius, radius * (0.5 + random()), random() * 6, 0, Math.PI * 2);
-      ctx.fill();
-    }
-    for (let index = 0; index < 12000; index++) {
-      const shade = random();
-      ctx.fillStyle = shade < 0.45 ? "rgba(28,73,31,0.18)" : "rgba(207,212,130,0.17)";
-      ctx.fillRect(random() * 768, random() * 768, 1 + random() * 2, 1 + random() * 3);
-    }
+    this.terrainCtx = canvas.getContext("2d")!;
+    this.paintBaseTerrain();
 
     this.terrainTexture = new THREE.CanvasTexture(canvas);
     this.terrainTexture.colorSpace = THREE.SRGBColorSpace;
@@ -852,6 +896,73 @@ export class GameEngine {
     this.scene.add(ground);
 
     this.createRoad();
+  }
+
+  // Rumput prosedural bawaan (dipakai saat tidak ada peta PNG).
+  private paintBaseTerrain() {
+    const ctx = this.terrainCtx;
+    if (!ctx) return;
+    const random = randomGenerator(2917);
+    ctx.fillStyle = "#66874b";
+    ctx.fillRect(0, 0, 768, 768);
+    for (let index = 0; index < 700; index++) {
+      const x = random() * 768;
+      const y = random() * 768;
+      const radius = 8 + random() * 36;
+      ctx.fillStyle = random() > 0.5 ? "rgba(23,70,34,0.055)" : "rgba(218,205,117,0.07)";
+      ctx.beginPath();
+      ctx.ellipse(x, y, radius, radius * (0.5 + random()), random() * 6, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    for (let index = 0; index < 12000; index++) {
+      const shade = random();
+      ctx.fillStyle = shade < 0.45 ? "rgba(28,73,31,0.18)" : "rgba(207,212,130,0.17)";
+      ctx.fillRect(random() * 768, random() * 768, 1 + random() * 2, 1 + random() * 3);
+    }
+    if (this.terrainTexture) this.terrainTexture.needsUpdate = true;
+  }
+
+  // Gambar PNG peta langsung ke tanah: tampilan arena = gambar aslinya.
+  private paintTerrainFromImage(image: HTMLImageElement) {
+    const ctx = this.terrainCtx;
+    if (!ctx) return;
+    this.paintBaseTerrain();
+    // Arena 160x120 unit di tengah bidang visual 240x190 -> 768px.
+    const pxPerUnitX = 768 / (VISUAL_HALF_X * 2);
+    const pxPerUnitZ = 768 / (VISUAL_HALF_Z * 2);
+    const drawX = (VISUAL_HALF_X - this.arenaHalfX) * pxPerUnitX;
+    const drawZ = (VISUAL_HALF_Z - this.arenaHalfZ) * pxPerUnitZ;
+    const drawW = this.arenaHalfX * 2 * pxPerUnitX;
+    const drawH = this.arenaHalfZ * 2 * pxPerUnitZ;
+    ctx.save();
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    if (this.svgRotation % 180 !== 0) {
+      // Gambar diputar 90/270: gambar di sekitar pusat arena dengan dims tertukar.
+      ctx.translate(drawX + drawW / 2, drawZ + drawH / 2);
+      ctx.rotate((this.svgRotation * Math.PI) / 180);
+      ctx.drawImage(image, -drawH / 2, -drawW / 2, drawH, drawW);
+    } else {
+      ctx.drawImage(image, drawX, drawZ, drawW, drawH);
+    }
+    // Bul lembut: gradasi tepi agar PNG menyatu dengan rumput di sekelilingnya.
+    const feather = 14;
+    const gradients: [number, number, number, number, [number, number, number, number]][] = [
+      [drawX, drawZ, drawX + feather, drawZ],
+      [drawX + drawW, drawZ, drawX + drawW - feather, drawZ],
+      [drawX, drawZ, drawX, drawZ + feather],
+      [drawX, drawZ + drawH, drawX, drawZ + drawH - feather],
+    ].map(([x0, y0, x1, y1]) => [x0, y0, x1, y1, [102, 135, 75, 0.85]] as [number, number, number, number, [number, number, number, number]]);
+    for (const [x0, y0, x1, y1, color] of gradients) {
+      const gradient = ctx.createLinearGradient(x0, y0, x1, y1);
+      gradient.addColorStop(0, `rgba(${color[0]},${color[1]},${color[2]},${color[3]})`);
+      gradient.addColorStop(1, `rgba(${color[0]},${color[1]},${color[2]},0)`);
+      ctx.fillStyle = gradient;
+      if (y0 === y1) ctx.fillRect(Math.min(x0, x1), drawZ, feather, drawH);
+      else ctx.fillRect(drawX, Math.min(y0, y1), drawW, feather);
+    }
+    ctx.restore();
+    if (this.terrainTexture) this.terrainTexture.needsUpdate = true;
   }
 
   private distanceToPathSquared(x: number, z: number) {
@@ -880,6 +991,8 @@ export class GameEngine {
   }
 
   private createDecorations() {
+    // Peta PNG: terrain sudah berupa gambar, dekorasi 3D dinonaktifkan.
+    if (this.svgGrid) return;
     const random = randomGenerator(4623 ^ this.trackSeed);
     const dummy = new THREE.Object3D();
     const configs = [
@@ -927,10 +1040,11 @@ export class GameEngine {
       let attempts = 0;
       while (placed < config.count && attempts < config.count * 30) {
         attempts++;
-        const x = (random() - 0.5) * (MAP_HALF_X * 2 - 6);
-        const z = (random() - 0.5) * (MAP_HALF_Z * 2 - 6);
+        const x = (random() - 0.5) * (this.arenaHalfX * 2 - 6);
+        const z = (random() - 0.5) * (this.arenaHalfZ * 2 - 6);
         if (this.distanceToPathSquared(x, z) < config.padding * config.padding) continue;
-        if (x * x + z * z < 10.5 ** 2) continue;
+        if (this.svgGrid && gridBlocked(this.svgGrid, x, z, 1.8)) continue;
+        if ((x - this.fortressX) ** 2 + z * z < 10.5 ** 2) continue;
         if (this.towers.some((tower) => (tower.x - x) ** 2 + (tower.z - z) ** 2 < 3.1 ** 2)) continue;
         const scale = config.minScale + random() * (config.maxScale - config.minScale);
         dummy.position.set(x, config.count === 145 ? 0.12 * scale : config.count === 190 ? 0.38 * scale : config.count === 46 ? 1.25 * scale : 0.32 * scale, z);
@@ -1019,6 +1133,8 @@ export class GameEngine {
     flag.position.set(0, 9.6, 1.05);
     this.fortressFlag = flag;
     group.add(flag);
+    // Benteng berdiri di tepi timur (kanan layar) — tujuan akhir horde orc.
+    group.position.set(this.fortressX, 0, 0);
     this.scene.add(group);
 
     const stakeMaterial = new THREE.MeshLambertMaterial({ color: 0x704b31, flatShading: true });
@@ -1516,8 +1632,9 @@ export class GameEngine {
       for (const side of [-1, 1]) {
         for (let rank = 0; rank < 3; rank++) {
           const guardId = -100 - (lane * 6 + (side === 1 ? 3 : 0) + rank);
-          // Spaced evenly along the defense line flanking the road (~55-65% along path from fortress)
-          const stepIndex = clamp(190 + rank * 12, 0, path.length - 1);
+          // Spaced evenly along the defense line flanking the road (~80-85% along path,
+          // menjaga pendekatan benteng di tepi timur)
+          const stepIndex = clamp(286 + rank * 11, 0, path.length - 1);
           const pt = path[stepIndex];
           const homeX = pt.x + pt.nx * (side * 5.8);
           const homeZ = pt.z + pt.nz * (side * 5.8);
@@ -1628,8 +1745,8 @@ export class GameEngine {
 
       // Knockback trajectory, tumbling in the air, and smoking from Hulk smash
       if (unit.vx || unit.vz || (unit.liftV !== undefined && unit.liftV !== 0) || (unit.lift !== undefined && unit.lift > 0)) {
-        unit.x = clamp(unit.x + (unit.vx || 0) * dt, -MAP_HALF_X + 4, MAP_HALF_X - 4);
-        unit.z = clamp(unit.z + (unit.vz || 0) * dt, -MAP_HALF_Z + 4, MAP_HALF_Z - 4);
+        unit.x = clamp(unit.x + (unit.vx || 0) * dt, -this.arenaHalfX + 4, this.arenaHalfX - 4);
+        unit.z = clamp(unit.z + (unit.vz || 0) * dt, -this.arenaHalfZ + 4, this.arenaHalfZ - 4);
         unit.vx = (unit.vx || 0) * Math.exp(-dt * 2.8);
         unit.vz = (unit.vz || 0) * Math.exp(-dt * 2.8);
 
@@ -1764,8 +1881,8 @@ export class GameEngine {
           unit.x = oldX;
           unit.z = oldZ;
         }
-        unit.x = clamp(unit.x, -MAP_HALF_X + 5, MAP_HALF_X - 5);
-        unit.z = clamp(unit.z, -MAP_HALF_Z + 5, MAP_HALF_Z - 5);
+        unit.x = clamp(unit.x, -this.arenaHalfX + 5, this.arenaHalfX - 5);
+        unit.z = clamp(unit.z, -this.arenaHalfZ + 5, this.arenaHalfZ - 5);
         const moved = Math.hypot(unit.x - oldX, unit.z - oldZ);
         const oldPhase = unit.walkPhase;
         // Heavy Hulkbuster walking stride
@@ -2307,15 +2424,46 @@ export class GameEngine {
       if (Math.abs(obstacle.x - body.x) > 2 || Math.abs(obstacle.z - body.z) > 2) continue;
       collided = this.resolveCircle(body, obstacle.x, obstacle.z, obstacle.radius) || collided;
     }
-    if (Math.abs(body.x) < 8 && Math.abs(body.z) < 8) {
-      collided = this.resolveCircle(body, 0, 0, 3.25) || collided;
+    if (this.svgGrid) {
+      // Tabrakan eksak kotak-sel: orc menempel pas di tepi tembok PNG.
+      const bodyRadius = body.scale * 0.39;
+      gridCollideBox(this.svgGrid, body, bodyRadius, (nx, nz, depth) => {
+        body.x += nx * depth;
+        body.z += nz * depth;
+        const inward = body.vx * nx + body.vz * nz;
+        if (inward < 0) {
+          body.vx -= nx * inward * 1.38;
+          body.vz -= nz * inward * 1.38;
+        }
+        collided = true;
+      });
+    }
+    if (Math.abs(body.x - this.fortressX) < 8.5 && Math.abs(body.z) < 8.5) {
+      collided = this.resolveCircle(body, this.fortressX, 0, 3.25) || collided;
       for (const x of [-5.2, 5.2]) {
-        for (const z of [-5.2, 5.2]) collided = this.resolveCircle(body, x, z, 1.17) || collided;
+        for (const z of [-5.2, 5.2]) collided = this.resolveCircle(body, this.fortressX + x, z, 1.17) || collided;
       }
     }
     if (collided) this.constrainToLane(body);
-    body.x = clamp(body.x, -MAP_HALF_X + 4, MAP_HALF_X - 4);
-    body.z = clamp(body.z, -MAP_HALF_Z + 3, MAP_HALF_Z - 3);
+    body.x = clamp(body.x, -this.arenaHalfX - 14, this.arenaHalfX + 8);
+    body.z = clamp(body.z, -this.arenaHalfZ + 3, this.arenaHalfZ - 3);
+    if (this.svgGrid) {
+      // Anti-terowongan: knockback cepat bisa melompati tembok tipis dalam
+      // satu frame. Segmen dari posisi aman frame lalu ke posisi sekarang
+      // tidak boleh memotong sel tembok mana pun.
+      const sx = body.safeX ?? body.x;
+      const sz = body.safeZ ?? body.z;
+      if (segmentHitsWall(this.svgGrid, sx, sz, body.x, body.z)) {
+        body.x = sx;
+        body.z = sz;
+        body.vx *= 0.15;
+        body.vz *= 0.15;
+        this.constrainToLane(body);
+      } else if (!gridIsWall(this.svgGrid, body.x, body.z)) {
+        body.safeX = body.x;
+        body.safeZ = body.z;
+      }
+    }
   }
 
   private spawnOrc() {
@@ -2550,8 +2698,8 @@ export class GameEngine {
           this.damageTower(raidTower, enemy.armored ? 6 : 4, enemy);
         }
       }
-      const breachReach = enemy.isSuperHulk ? 12.0 ** 2 : 7.2 ** 2;
-      if (enemy.distance >= this.pathLengths[enemy.lane] - 4.6 && enemy.x * enemy.x + enemy.z * enemy.z < breachReach) {
+      const breachX = enemy.isSuperHulk ? this.arenaHalfX - 9 : this.arenaHalfX - 6;
+      if (enemy.distance >= this.pathLengths[enemy.lane] - 14 && enemy.x >= breachX) {
         enemy.alive = false;
         this.escaped++;
         const breachDamage = enemy.isSuperHulk ? 10 : enemy.isHulk ? 4 : enemy.armored ? 2 : 1;
@@ -2661,7 +2809,7 @@ export class GameEngine {
         }
         corpse.vy = Math.abs(corpse.vy) > 2 ? Math.abs(corpse.vy) * 0.28 : 0;
       }
-      if (corpse.age > 1.8 || Math.abs(corpse.x) > MAP_HALF_X || Math.abs(corpse.z) > MAP_HALF_Z) {
+      if (corpse.age > 1.8 || Math.abs(corpse.x) > this.arenaHalfX || Math.abs(corpse.z) > this.arenaHalfZ) {
         this.corpses.splice(index, 1);
       }
     }
@@ -4113,10 +4261,20 @@ export class GameEngine {
     this.emit();
   }
 
-  private isValidPlacement(x: number, z: number, ignoredTowerId?: number) {
-    if (Math.abs(x) > MAP_HALF_X - 8 || Math.abs(z) > MAP_HALF_Z - 7) return false;
-    if (x * x + z * z < 8.7 ** 2) return false;
-    if (this.distanceToPathSquared(x, z) < 6.4 ** 2) return false;
+  private isValidPlacement(x: number, z: number, ignoredTowerId?: number, emergency = false) {
+    // Peta PNG: koridor transparan sempit, jadi aturan diperlonggar agar
+    // turret/outpost tetap bisa ditempatkan di area collision. Mode darurat
+    // (lorong sangat sempit): clearance minimum tanpa overlap visual.
+    const svgMode = this.svgGrid !== null;
+    const marginX = svgMode ? (emergency ? 4 : 6) : 8;
+    const marginZ = svgMode ? (emergency ? 3 : 5) : 7;
+    const laneClearance = svgMode ? (emergency ? 3.2 : 4.0) : 6.4;
+    const wallClearance = svgMode ? (emergency ? 1.2 : 1.6) : 2.1;
+    if (Math.abs(x) > this.arenaHalfX - marginX || Math.abs(z) > this.arenaHalfZ - marginZ) return false;
+    if ((x - this.fortressX) ** 2 + z * z < 8.7 ** 2) return false;
+    if (this.distanceToPathSquared(x, z) < laneClearance ** 2) return false;
+    // Turret hanya boleh di area collision terbuka (transparan pada PNG).
+    if (this.svgGrid && gridBlocked(this.svgGrid, x, z, wallClearance)) return false;
     if (this.terrainObstacles.some((obstacle) => (obstacle.x - x) ** 2 + (obstacle.z - z) ** 2 < (obstacle.radius + 1.45) ** 2)) return false;
     return !this.towers.some((tower) => tower.id !== ignoredTowerId && (tower.x - x) ** 2 + (tower.z - z) ** 2 < 3.2 ** 2);
   }
@@ -4143,19 +4301,12 @@ export class GameEngine {
     }
   }
 
-  public generateTrack() {
-    if (this.phase !== "build") {
-      this.onToast("Buat jalur baru saat fase build, sebelum wave dimulai.");
-      return;
-    }
-
-    let seed = Math.floor(Math.random() * 999999) + 1;
-    if (seed === this.trackSeed) seed = seed % 999999 + 1;
-    const lanes = createRaidLanes(seed, this.towers);
-    this.trackSeed = seed;
-    this.trackLanes = lanes;
+  private rebuildTrack() {
+    if (this.svgImage) this.paintTerrainFromImage(this.svgImage);
+    else this.paintBaseTerrain();
     this.createPath();
     this.createRoad();
+
     this.clearDecorations();
     this.relocateTowers();
     this.initLaneGuardMarines();
@@ -4167,13 +4318,166 @@ export class GameEngine {
     this.splatMesh.count = 0;
     this.updateRangeRings();
     this.updateGhost();
+    this.clampCameraTarget();
+  }
+
+  public generateTrack() {
+    if (this.phase !== "build") {
+      this.onToast("Buat jalur baru saat fase build, sebelum wave dimulai.");
+      return;
+    }
+
+    let seed = Math.floor(Math.random() * 999999) + 1;
+    if (seed === this.trackSeed) seed = seed % 999999 + 1;
+    const lanes = createRaidLanes(seed, this.towers);
+    this.trackSeed = seed;
+    this.trackLanes = lanes;
+    this.svgDataUrl = null;
+    this.svgLanes = null;
+    this.svgGrid = null;
+    this.svgImage = null;
+    this.svgRotation = 0;
+    this.arenaHalfX = MAP_HALF_X;
+    this.arenaHalfZ = MAP_HALF_Z;
+    this.fortressX = FORTRESS_X;
+    try {
+      localStorage.removeItem(SVG_STORAGE_KEY);
+    } catch {
+      // Peta PNG lama boleh tetap ada bila storage diblokir.
+    }
+    this.rebuildTrack();
     this.playSound("place");
     try {
       localStorage.setItem(TRACK_STORAGE_KEY, JSON.stringify({ seed, lanes }));
     } catch {
       // Rerolling remains available even without persistent storage.
     }
-    this.onToast(`${trackName(seed)}: 4 jalur baru dari semua sisi, ${Math.round(this.pathLength)}m total.`);
+    this.onToast(`${trackName(seed)}: 4 jalur baru dari barat ke timur, ${Math.round(this.pathLength)}m total.`);
+    this.emit();
+  }
+
+  // Pasang peta dari gambar yang diunggah (PNG/JPG): area opaque/gelap jadi dinding.
+  public async applySvgMap(dataUrl: string, preferredRotation = 0) {
+    if (this.phase !== "build") {
+      this.onToast("⏳ Peta hanya bisa diganti di fase bangun (sebelum wave dimulai).");
+      return;
+    }
+    if (!dataUrl.startsWith("data:image/") || dataUrl.length > SVG_MAX_DATAURL) {
+      this.onToast("❌ File gambar tidak didukung atau terlalu besar (maks ~2MB).");
+      return;
+    }
+    this.onToast("⏳ Memproses peta dari gambar...");
+    let result: Awaited<ReturnType<typeof loadSvgMap>> | null = null;
+    try {
+      result = await loadSvgMap(dataUrl, preferredRotation);
+    } catch {
+      result = null;
+    }
+    if (!result || !result.ok) {
+      const reason = result && !result.ok ? ` ${result.reason}` : "";
+      this.onToast(`❌ Peta gagal dimuat: ${reason}`);
+      return;
+    }
+    if (!("grid" in result)) return;
+    this.svgDataUrl = dataUrl;
+    this.svgLanes = result.lanes;
+    this.svgGrid = result.grid;
+    this.svgImage = result.image;
+    this.svgRotation = result.rotation;
+    this.trackLanes = result.lanes;
+    // Arena mengikuti panjang & lebar PNG.
+    this.arenaHalfX = result.grid.halfX;
+    this.arenaHalfZ = result.grid.halfZ;
+    this.fortressX = result.grid.endX - 6;
+    try {
+      localStorage.setItem(SVG_STORAGE_KEY, JSON.stringify({ data: dataUrl, rotation: this.svgRotation }));
+    } catch {
+      // Peta tetap aktif di sesi ini walau storage penuh.
+    }
+    this.rebuildTrack();
+    this.playSound("place");
+    const rotNote = result.rotation !== 0 ? `, diputar ${result.rotation}°` : "";
+    const carveNote = result.carvedCells > 0
+      ? ` ⚠️ Tidak ada lorong transparan kiri→kanan di arah ini: ${result.carvedCells} sel tembok dibuka paksa untuk jalur orc — tekan PUTAR 90° kalau mau arah lain.`
+      : "";
+    this.onToast(`🗺️ PNG ${result.width}×${result.height}px dipasang: arena ${Math.round(result.grid.halfX * 2)}×${Math.round(result.grid.halfZ * 2)}m, area opaque = tembok, transparan = jalur orc${rotNote}.${carveNote}`);
+    this.emit();
+  }
+
+  // Putar peta PNG 90° searah jarum jam (jalur orc & collision dihitung ulang).
+  public rotateSvgMap() {
+    if (this.phase !== "build") {
+      this.onToast("⏳ Peta hanya bisa diputar di fase bangun.");
+      return;
+    }
+    if (!this.svgGrid || !this.svgImage || !this.svgDataUrl) {
+      this.onToast("Peta PNG belum aktif — unggah dulu lewat PETA DARI PNG.");
+      return;
+    }
+    const grid = this.svgGrid;
+    const ngw = grid.gh;
+    const ngh = grid.gw;
+    const walls = new Uint8Array(ngw * ngh);
+    for (let j = 0; j < grid.gh; j++) {
+      for (let i = 0; i < grid.gw; i++) {
+        walls[i * ngw + (ngw - 1 - j)] = grid.walls[j * grid.gw + i];
+      }
+    }
+    const rotated: CollisionGrid = {
+      walls,
+      gw: ngw,
+      gh: ngh,
+      halfX: grid.halfZ,
+      halfZ: grid.halfX,
+      startX: -(grid.halfZ + 12),
+      endX: grid.halfZ + 10,
+    };
+    // Selalu berhasil: kalau tidak ada lorong transparan kiri→kanan di arah
+    // ini, jalur orc dicari "lunak" dan sel tembok yang dilewati dibuka paksa.
+    const built = buildLanesFromWalls(rotated);
+    this.svgGrid = built.carved;
+    this.svgLanes = built.lanes;
+    this.trackLanes = built.lanes;
+    this.arenaHalfX = rotated.halfX;
+    this.arenaHalfZ = rotated.halfZ;
+    this.fortressX = rotated.endX - 6;
+    this.svgRotation = (this.svgRotation + 90) % 360;
+    this.rebuildTrack();
+    this.playSound("place");
+    try {
+      localStorage.setItem(SVG_STORAGE_KEY, JSON.stringify({ data: this.svgDataUrl, rotation: this.svgRotation }));
+    } catch {
+      // Tanpa storage, rotasi tetap berlaku di sesi ini.
+    }
+    const carveNote = built.carvedCells > 0
+      ? ` ⚠️ Tidak ada lorong transparan kiri→kanan di arah ini — ${built.carvedCells} sel tembok dibuka paksa.`
+      : "";
+    this.onToast(`🔄 Peta diputar 90° (total ${this.svgRotation}°). Jalur orc & collision dihitung ulang.${carveNote}`);
+    this.emit();
+  }
+
+  public clearSvgMap() {
+    if (this.phase !== "build") {
+      this.onToast("⏳ Peta hanya bisa diganti di fase bangun (sebelum wave dimulai).");
+      return;
+    }
+    if (!this.svgDataUrl) return;
+    this.svgDataUrl = null;
+    this.svgLanes = null;
+    this.svgGrid = null;
+    this.svgImage = null;
+    this.svgRotation = 0;
+    this.arenaHalfX = MAP_HALF_X;
+    this.arenaHalfZ = MAP_HALF_Z;
+    this.fortressX = FORTRESS_X;
+    try {
+      localStorage.removeItem(SVG_STORAGE_KEY);
+    } catch {
+      // Abaikan bila storage diblokir.
+    }
+    this.rebuildTrack();
+    this.playSound("place");
+    this.onToast("♻️ Peta PNG dihapus, kembali ke peta prosedural.");
     this.emit();
   }
 
@@ -4185,7 +4489,11 @@ export class GameEngine {
     if (this.phase === "build" && this.selectedType) {
       const capacity = this.towers.length < MAX_TOWERS &&
         (this.selectedType !== "barracks" || this.towers.filter((tower) => tower.type === "barracks").length < MAX_BARRACKS);
-      const valid = capacity && this.isValidPlacement(this.pointerPoint.x, this.pointerPoint.z) && this.scrap >= TOWERS[this.selectedType].cost;
+      const px = this.pointerPoint.x;
+      const pz = this.pointerPoint.z;
+      const valid = capacity &&
+        (this.isValidPlacement(px, pz) || (this.svgGrid !== null && this.isValidPlacement(px, pz, undefined, true))) &&
+        this.scrap >= TOWERS[this.selectedType].cost;
       this.ghostRing.scale.setScalar(TOWERS[this.selectedType].range);
       this.ghostRing.material.color.set(valid ? 0xf1dfaa : 0xf17769);
       this.ghostCore.material.color.set(valid ? 0xe7c574 : 0xf17769);
@@ -4321,8 +4629,8 @@ export class GameEngine {
         this.onToast("Batas pertahanan tercapai. Jual tower lain untuk membuka ruang.");
       } else if (this.scrap < config.cost) {
         this.onToast("Coin tidak cukup untuk tower ini.");
-      } else if (!this.isValidPlacement(x, z)) {
-        this.onToast("Bangun di tanah kosong, jauh dari jalur orc.");
+      } else if (!this.isValidPlacement(x, z) && !(this.svgGrid !== null && this.isValidPlacement(x, z, undefined, true))) {
+        this.onToast("Bangun di area transparan peta (bukan tembok/jalur orc).");
       } else {
         this.scrap -= config.cost;
         this.addTower(this.selectedType, x, z);

@@ -20,6 +20,7 @@ import {
   Play,
   RotateCcw,
   Rocket,
+  RotateCw,
   ScanLine,
   Shield,
   Shuffle,
@@ -87,8 +88,10 @@ const initialSnapshot: GameSnapshot = {
   wave: 1,
   bestWave: 0,
   trackSeed: 0,
-  trackName: "FOUR FRONTS",
+  trackName: "FOUR CORRIDORS",
   trackLength: 370,
+  svgMap: false,
+  svgRotation: 0,
   weather: "sunny",
   cameraZoom: 1,
   orcSpeed: 1,
@@ -168,6 +171,7 @@ export default function App() {
   const stageRef = useRef<HTMLDivElement>(null);
   const engineRef = useRef<GameEngine | null>(null);
   const toastTimer = useRef<number | null>(null);
+  const svgInputRef = useRef<HTMLInputElement | null>(null);
   const flashTimer = useRef<number | null>(null);
   const resumeAfterHelp = useRef(false);
   const [game, setGame] = useState<GameSnapshot>(initialSnapshot);
@@ -310,7 +314,7 @@ export default function App() {
           <div className="field-heading">
             <div className="field-kicker"><span className="field-kicker-line" /> {game.trackName} <span className="kicker-index">/ 01</span></div>
             <h1 className={isBuild ? "brand-field-title" : ""}>{isBuild ? <>SIR, WE HAVE AN<br /><em>ORC PROBLEM.</em></> : isBattle ? <>Here they <em>come.</em></> : game.phase === "victory" ? <>Line <em>secured.</em></> : <>The line <em>fell.</em></>}</h1>
-            <p>{isBuild ? "Empat arah. Satu benteng. Rancang pertahananmu." : isBattle ? "Serangan datang dari seluruh penjuru." : "The war is far from over."}</p>
+            <p>{isBuild ? "Orc berbaris dari barat menuju benteng di timur. Rancang pertahananmu." : isBattle ? "Gelombang orc bergerak dari tepi kiri menuju tepi kanan arena." : "The war is far from over."}</p>
           </div>
 
           <div className="field-wave" aria-label={`Gelombang ${game.wave}`}><span>{isBuild ? "NEXT WAVE" : isBattle ? "WAVE IN PROGRESS" : "WAVE"}</span><strong>{pad(game.wave)}</strong></div>
@@ -411,10 +415,56 @@ export default function App() {
                   </button>
                 </div>
                 {isBuild && (
-                  <button type="button" className="track-generate" onClick={() => engineRef.current?.generateTrack()} title="Buat empat jalur serangan baru dari barat, utara, timur, dan selatan (G)">
-                    <span><Shuffle size={13} /> GENERATE 4 JALUR</span>
-                    <small>{Math.round(game.trackLength)}m<kbd>G</kbd></small>
-                  </button>
+                  <div className="track-tools">
+                    <input
+                      ref={svgInputRef}
+                      type="file"
+                      accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp"
+                      style={{ display: "none" }}
+                      onChange={(event) => {
+                        const file = event.target.files?.[0];
+                        if (file) {
+                          const reader = new FileReader();
+                          reader.onload = () => engineRef.current?.applySvgMap(String(reader.result), game.svgRotation);
+                          reader.readAsDataURL(file);
+                        }
+                        event.target.value = "";
+                      }}
+                    />
+                    <button
+                      type="button"
+                      className="track-generate svg-upload-btn"
+                      onClick={() => svgInputRef.current?.click()}
+                      title="Unggah PNG peta: terrain mengikuti gambar, area gelap/opaque jadi DINDING, transparan = jalur orc. Peta APA PUN diterima — kalau tidak ada lorong kiri→kanan, jalur orc membuka jalan otomatis"
+                    >
+                      <span><ScanLine size={13} /> {game.svgMap ? "GANTI PNG PETA" : "PETA DARI PNG"}</span>
+                      <small>{game.svgMap ? "aktif" : "png"}<ScanLine size={11} /></small>
+                    </button>
+                    {game.svgMap && (
+                      <button
+                        type="button"
+                        className="track-generate svg-clear-btn"
+                        onClick={() => engineRef.current?.clearSvgMap()}
+                        title="Hapus peta gambar, kembali ke peta prosedural"
+                      >
+                        <span><Trash2 size={13} /> HAPUS PETA</span>
+                      </button>
+                    )}
+                    {game.svgMap && (
+                      <button
+                        type="button"
+                        className="track-generate svg-rotate-btn"
+                        onClick={() => engineRef.current?.rotateSvgMap()}
+                        title="Putar peta PNG 90° searah jarum jam — selalu bisa: jalur orc, collision & terrain dihitung ulang (kalau perlu, jalan dibuka paksa)"
+                      >
+                        <span><RotateCw size={13} /> PUTAR 90°</span>
+                      </button>
+                    )}
+                    <button type="button" className="track-generate" onClick={() => engineRef.current?.generateTrack()} title="Buat empat jalur serangan baru dari barat ke timur (G)">
+                      <span><Shuffle size={13} /> GENERATE 4 JALUR</span>
+                      <small>{Math.round(game.trackLength)}m<kbd>G</kbd></small>
+                    </button>
+                  </div>
                 )}
               </div>
             )}
@@ -528,13 +578,14 @@ export default function App() {
               <div><span>FIELD MANUAL / 01</span><h2>How to hold the line<span>.</span></h2></div>
               <button type="button" aria-label="Tutup petunjuk" onClick={closeHelp}><X size={20} /></button>
             </div>
-            <p className="help-lead">Benteng berada di tengah arena. Horde datang dari barat, utara, timur, dan selatan. Amati jumlah orc di tiap sisi, lalu tempatkan turret di rute yang paling terancam.</p>
+              <p className="help-lead">Benteng berada di tepi kanan arena. Horde orc berbaris dari tepi kiri menuju benteng lewat empat jalur. Amati jalur yang paling terancam, lalu tempatkan turret di rutenya.</p>
             <div className="help-columns">
               <div className="help-group">
                 <span className="help-group-title">01 / BANGUN PERTAHANAN</span>
                 <div><kbd>1-7</kbd><span>Pilih turret, termasuk Rocket Battery (7) pencari zombie & Marine (6)</span></div>
                 <div><kbd>CLICK</kbd><span>Letakkan atau pilih turret</span></div>
-                <div><kbd>G</kbd><span>Buat ulang empat jalur dari semua sisi</span></div>
+                <div><kbd>G</kbd><span>Buat ulang empat jalur dari barat ke timur</span></div>
+                <div><kbd>PNG</kbd><span>Unggah PNG peta: terrain mengikuti gambar, area gelap jadi dinding solid</span></div>
                 <div><kbd>DRAG</kbd><span>Geser peta; klik kanan singkat menjual turret</span></div>
                 <div><kbd>SPACE</kbd><span>Mulai gelombang</span></div>
               </div>
