@@ -7,7 +7,7 @@ import { MarineVisualSystem, type MarinePose } from "./MarineVisualSystem";
 import { OrcRunnerSystem, runCycle } from "./OrcRunnerSystem";
 import { RagdollSystem } from "./RagdollSystem";
 import { createRaidLanes, createDecorRoads, ENTRY_ORDER, isValidRaidLanes, MAP_HALF_X, MAP_HALF_Z, FORTRESS_X, trackName, VISUAL_HALF_X, VISUAL_HALF_Z, type RaidLane } from "./TrackGenerator";
-import { loadSvgMap, buildLanesFromWalls, gridBlocked, gridCollide, type CollisionGrid } from "./SvgMapSystem";
+import { loadSvgMap, buildLanesFromWalls, gridBlocked, gridCollideBox, gridIsWall, segmentHitsWall, type CollisionGrid } from "./SvgMapSystem";
 import { WeatherSystem } from "./WeatherSystem";
 import {
   ABILITIES,
@@ -66,6 +66,8 @@ interface Enemy {
   shockSparkTimer: number;
   isHulk?: boolean;
   isSuperHulk?: boolean;
+  safeX?: number; // posisi aman frame lalu (anti-terowongan tembok PNG)
+  safeZ?: number;
 }
 
 interface Corpse {
@@ -88,6 +90,8 @@ interface Corpse {
   landed: boolean;
   distance: number;
   lostParts: number;
+  safeX?: number;
+  safeZ?: number;
 }
 
 interface RifleShot {
@@ -834,8 +838,15 @@ export class GameEngine {
       (mesh.material as THREE.Material).dispose();
     }
     this.roadVisuals = [];
-    // Peta PNG: jalan sudah tergambar di terrain asli, ribbon tidak diperlukan.
-    if (!this.svgLanes) this.paths.forEach((samples, lane) => {
+    // Peta PNG: gambar penanda tepi jalan saja supaya batas area laluan orc
+    // (termasuk jalan paksa hasil carve) terlihat jelas di atas terrain.
+    if (this.svgLanes) {
+      this.paths.forEach((samples, lane) => {
+        const layer = lane * 0.002;
+        this.createRibbon(samples, 0.67, ROAD_COLORS[5], 0.045 + layer, -5.0, 0.85, 5);
+        this.createRibbon(samples, 0.67, ROAD_COLORS[5], 0.045 + layer, 5.0, 0.85, 6);
+      });
+    } else this.paths.forEach((samples, lane) => {
       const layer = lane * 0.002;
       this.createRibbon(samples, 12.3, ROAD_COLORS[0], -0.055 + layer, 0, 1, 0);
       this.createRibbon(samples, 9.9, ROAD_COLORS[1], -0.025 + layer, 0, 1, 1);
@@ -2414,7 +2425,18 @@ export class GameEngine {
       collided = this.resolveCircle(body, obstacle.x, obstacle.z, obstacle.radius) || collided;
     }
     if (this.svgGrid) {
-      gridCollide(this.svgGrid, body, (x, z, radius) => this.resolveCircle(body, x, z, radius));
+      // Tabrakan eksak kotak-sel: orc menempel pas di tepi tembok PNG.
+      const bodyRadius = body.scale * 0.39;
+      gridCollideBox(this.svgGrid, body, bodyRadius, (nx, nz, depth) => {
+        body.x += nx * depth;
+        body.z += nz * depth;
+        const inward = body.vx * nx + body.vz * nz;
+        if (inward < 0) {
+          body.vx -= nx * inward * 1.38;
+          body.vz -= nz * inward * 1.38;
+        }
+        collided = true;
+      });
     }
     if (Math.abs(body.x - this.fortressX) < 8.5 && Math.abs(body.z) < 8.5) {
       collided = this.resolveCircle(body, this.fortressX, 0, 3.25) || collided;
@@ -2425,6 +2447,23 @@ export class GameEngine {
     if (collided) this.constrainToLane(body);
     body.x = clamp(body.x, -this.arenaHalfX - 14, this.arenaHalfX + 8);
     body.z = clamp(body.z, -this.arenaHalfZ + 3, this.arenaHalfZ - 3);
+    if (this.svgGrid) {
+      // Anti-terowongan: knockback cepat bisa melompati tembok tipis dalam
+      // satu frame. Segmen dari posisi aman frame lalu ke posisi sekarang
+      // tidak boleh memotong sel tembok mana pun.
+      const sx = body.safeX ?? body.x;
+      const sz = body.safeZ ?? body.z;
+      if (segmentHitsWall(this.svgGrid, sx, sz, body.x, body.z)) {
+        body.x = sx;
+        body.z = sz;
+        body.vx *= 0.15;
+        body.vz *= 0.15;
+        this.constrainToLane(body);
+      } else if (!gridIsWall(this.svgGrid, body.x, body.z)) {
+        body.safeX = body.x;
+        body.safeZ = body.z;
+      }
+    }
   }
 
   private spawnOrc() {

@@ -51,11 +51,15 @@ export function gridBlocked(grid: CollisionGrid, x: number, z: number, radius: n
 }
 
 // Dorong tubuh (orc/mayat) keluar dari sel dinding di sekitarnya.
-export function gridCollide(
+// Tabrakan lingkaran (orc) vs kotak sel tembok — eksak: orc menempel pas di
+// tepi tembok, tidak ada celah sudut seperti aproksimasi lingkaran-vs-lingkaran.
+export function gridCollideBox(
   grid: CollisionGrid,
   body: { x: number; z: number },
-  resolve: (x: number, z: number, radius: number) => boolean,
+  radius: number,
+  resolve: (nx: number, nz: number, depth: number) => void,
 ) {
+  const half = SVG_CELL / 2;
   const i0 = Math.floor((body.x + grid.halfX) / SVG_CELL);
   const j0 = Math.floor((body.z + grid.halfZ) / SVG_CELL);
   for (let j = j0 - 1; j <= j0 + 1; j++) {
@@ -63,9 +67,49 @@ export function gridCollide(
     for (let i = i0 - 1; i <= i0 + 1; i++) {
       if (i < 0 || i >= grid.gw) continue;
       if (grid.walls[j * grid.gw + i] !== 1) continue;
-      resolve(gridCellX(grid, i), gridCellZ(grid, j), 1.24);
+      const cx = gridCellX(grid, i);
+      const cz = gridCellZ(grid, j);
+      const dx = body.x - cx;
+      const dz = body.z - cz;
+      const qx = clamp(dx, -half, half);
+      const qz = clamp(dz, -half, half);
+      const ox = dx - qx;
+      const oz = dz - qz;
+      if (ox !== 0 || oz !== 0) {
+        // Pusat di luar kotak: dorong menjauhi titik terdekat di tepi kotak.
+        const distance = Math.hypot(ox, oz);
+        if (distance < radius) {
+          const depth = radius - distance;
+          resolve(ox / distance, oz / distance, depth);
+        }
+      } else {
+        // Pusat di dalam kotak (knockback ekstrem): dorong keluar lewat sisi
+        // paling dangkal.
+        const px = half - Math.abs(dx);
+        const pz = half - Math.abs(dz);
+        if (px < pz) resolve(Math.sign(dx) || 1, 0, px + radius);
+        else resolve(0, Math.sign(dz) || 1, pz + radius);
+      }
     }
   }
+}
+
+// Apakah segmen garis (x0,z0)->(x1,z1) memotong sel tembok? Mencegah orc
+// "melompati" tembok tipis dalam satu frame akibat knockback cepat.
+export function segmentHitsWall(
+  grid: CollisionGrid,
+  x0: number,
+  z0: number,
+  x1: number,
+  z1: number,
+) {
+  const length = Math.hypot(x1 - x0, z1 - z0);
+  const steps = Math.max(1, Math.ceil(length / 0.8));
+  for (let k = 1; k <= steps; k++) {
+    const t = k / steps;
+    if (gridIsWall(grid, x0 + (x1 - x0) * t, z0 + (z1 - z0) * t)) return true;
+  }
+  return false;
 }
 
 const SQRT2 = Math.SQRT2;
