@@ -1,0 +1,6 @@
+{
+  "name": "Sir, We Have an Orc Problem",
+  "description": "A 3D WebGL tower defense game featuring armored marine squads, rifle fire, cleaving melee attacks, and physics-driven orc hordes.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
