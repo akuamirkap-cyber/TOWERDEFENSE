@@ -445,6 +445,7 @@ export class GameEngine {
   private svgLanes: RaidLane[] | null = null;
   private svgGrid: CollisionGrid | null = null;
   private svgImage: HTMLImageElement | null = null;
+  private svgRotation = 0;
   private terrainCtx: CanvasRenderingContext2D | null = null;
   // Ukuran arena aktif: mengikuti aspek PNG saat peta gambar dipasang.
   private arenaHalfX = MAP_HALF_X;
@@ -923,7 +924,14 @@ export class GameEngine {
     ctx.save();
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = "high";
-    ctx.drawImage(image, drawX, drawZ, drawW, drawH);
+    if (this.svgRotation % 180 !== 0) {
+      // Gambar diputar 90/270: gambar di sekitar pusat arena dengan dims tertukar.
+      ctx.translate(drawX + drawW / 2, drawZ + drawH / 2);
+      ctx.rotate((this.svgRotation * Math.PI) / 180);
+      ctx.drawImage(image, -drawH / 2, -drawW / 2, drawH, drawW);
+    } else {
+      ctx.drawImage(image, drawX, drawZ, drawW, drawH);
+    }
     // Bul lembut: gradasi tepi agar PNG menyatu dengan rumput di sekelilingnya.
     const feather = 14;
     const gradients: [number, number, number, number, [number, number, number, number]][] = [
@@ -4279,6 +4287,7 @@ export class GameEngine {
     this.svgLanes = null;
     this.svgGrid = null;
     this.svgImage = null;
+    this.svgRotation = 0;
     this.arenaHalfX = MAP_HALF_X;
     this.arenaHalfZ = MAP_HALF_Z;
     this.fortressX = FORTRESS_X;
@@ -4309,20 +4318,23 @@ export class GameEngine {
       return;
     }
     this.onToast("⏳ Memproses peta dari gambar...");
-    let result: Awaited<ReturnType<typeof loadSvgMap>> = null;
+    let result: Awaited<ReturnType<typeof loadSvgMap>> | null = null;
     try {
       result = await loadSvgMap(dataUrl);
     } catch {
       result = null;
     }
-    if (!result) {
-      this.onToast("❌ Peta ditolak: tidak ada ruang terbuka untuk jalur orc dari barat ke timur.");
+    if (!result || !result.ok) {
+      const reason = result && !result.ok ? ` ${result.reason}` : "";
+      this.onToast(`❌ Peta ditolak:${reason}`);
       return;
     }
+    if (!("grid" in result)) return;
     this.svgDataUrl = dataUrl;
     this.svgLanes = result.lanes;
     this.svgGrid = result.grid;
     this.svgImage = result.image;
+    this.svgRotation = result.rotation;
     this.trackLanes = result.lanes;
     // Arena mengikuti panjang & lebar PNG.
     this.arenaHalfX = result.grid.halfX;
@@ -4335,7 +4347,8 @@ export class GameEngine {
     }
     this.rebuildTrack();
     this.playSound("place");
-    this.onToast(`🗺️ PNG ${result.width}×${result.height}px dipasang: arena ${Math.round(result.grid.halfX * 2)}×${Math.round(result.grid.halfZ * 2)}m, area opaque = tembok, transparan = jalur orc.`);
+    const rotNote = result.rotation !== 0 ? `, diputar ${result.rotation}° agar jalur kiri→kanan tersambung` : "";
+    this.onToast(`🗺️ PNG ${result.width}×${result.height}px dipasang: arena ${Math.round(result.grid.halfX * 2)}×${Math.round(result.grid.halfZ * 2)}m, area opaque = tembok, transparan = jalur orc${rotNote}.`);
     this.emit();
   }
 
@@ -4349,6 +4362,7 @@ export class GameEngine {
     this.svgLanes = null;
     this.svgGrid = null;
     this.svgImage = null;
+    this.svgRotation = 0;
     this.arenaHalfX = MAP_HALF_X;
     this.arenaHalfZ = MAP_HALF_Z;
     this.fortressX = FORTRESS_X;

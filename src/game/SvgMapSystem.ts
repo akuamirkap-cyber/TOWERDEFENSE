@@ -137,6 +137,9 @@ class MinHeap {
   }
 }
 
+// Penggembungan dinding: sel terbuka yang menempel dinding dianggap solid
+// agar orc (radius ~0.6) tidak menggerus sudut. Sel transparan yang
+// menyentuh 6 kolom tepi barat/timur tetap terbuka (pintu masuk/keluar).
 function inflateWalls(grid: CollisionGrid, transparent: Uint8Array) {
   const out = new Uint8Array(grid.walls);
   for (let j = 0; j < grid.gh; j++) {
@@ -159,17 +162,57 @@ function inflateWalls(grid: CollisionGrid, transparent: Uint8Array) {
       out[cell] = blocked;
     }
   }
-  // Pintu masuk/keluar HANYA di sel tepi yang transparan pada PNG aslinya:
-  // orc masuk lewat area terbuka yang menyentuh tepi barat, keluar di tepi timur.
   for (let j = 0; j < grid.gh; j++) {
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 6; i++) {
       if (transparent[j * grid.gw + i] === 1) out[j * grid.gw + i] = 0;
     }
-    for (let i = grid.gw - 3; i < grid.gw; i++) {
+    for (let i = grid.gw - 6; i < grid.gw; i++) {
       if (transparent[j * grid.gw + i] === 1) out[j * grid.gw + i] = 0;
     }
   }
   return out;
+}
+
+// Jalur sel terbuka dari tepi (barat/timur) menuju sel target — dipakai agar
+// awal & akhir lajur selalu menembus pintu transparan, bukan menembus tembok.
+function pathToEdge(grid: CollisionGrid, blocked: Uint8Array, target: PathCell, side: -1 | 1): PathCell[] {
+  const edgeCol = side === -1 ? 0 : grid.gw - 1;
+  const parent = new Int32Array(grid.gw * grid.gh).fill(-2);
+  const queue: number[] = [];
+  for (let j = 0; j < grid.gh; j++) {
+    const idx = edgeCol + j * grid.gw;
+    if (blocked[idx] === 1) continue;
+    parent[idx] = -1;
+    queue.push(idx);
+  }
+  const targetIdx = target.j * grid.gw + target.i;
+  let head = 0;
+  while (head < queue.length) {
+    const current = queue[head++];
+    if (current === targetIdx) break;
+    const ci = current % grid.gw;
+    const cj = (current - ci) / grid.gw;
+    for (const [dx, dz] of DIRS) {
+      const ni = ci + dx;
+      const nj = cj + dz;
+      if (ni < 0 || ni >= grid.gw || nj < 0 || nj >= grid.gh) continue;
+      const next = nj * grid.gw + ni;
+      if (parent[next] !== -2 || blocked[next] === 1) continue;
+      // Diagonal tidak boleh menyobek sudut sel dinding.
+      if (dx !== 0 && dz !== 0 && (blocked[cj * grid.gw + ni] === 1 || blocked[nj * grid.gw + ci] === 1)) continue;
+      parent[next] = current;
+      queue.push(next);
+    }
+  }
+  if (parent[targetIdx] === -2) return [target];
+  const chain: PathCell[] = [];
+  let cursor = targetIdx;
+  while (cursor >= 0) {
+    const i = cursor % grid.gw;
+    chain.push({ i, j: (cursor - i) / grid.gw });
+    cursor = parent[cursor];
+  }
+  return chain.reverse(); // dari tepi menuju target
 }
 
 const DIRS: readonly (readonly [number, number, number])[] = [
@@ -183,30 +226,76 @@ interface PathCell {
   j: number;
 }
 
-function findPath(grid: CollisionGrid, blocked: Uint8Array, separation: Float32Array, band: Band): PathCell[] | null {
+// Flood-fill dari tepi barat (side=-1) atau timur (side=1) lewat sel terbuka.
+// Menjamin orc hanya bisa masuk/keluar lewat area transparan yang tersambung
+// ke tepi peta, bukan "muncul" di dalam area tertutup.
+function edgeReachable(grid: CollisionGrid, blocked: Uint8Array, side: -1 | 1) {
+  const reach = new Uint8Array(grid.gw * grid.gh);
+  const stack: number[] = [];
+  const edgeCol = side === -1 ? 0 : grid.gw - 1;
+  for (let j = 0; j < grid.gh; j++) {
+    const idx = edgeCol + j * grid.gw;
+    if (blocked[idx] === 1) continue;
+    reach[idx] = 1;
+    stack.push(idx);
+  }
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    const ci = current % grid.gw;
+    const cj = (current - ci) / grid.gw;
+    for (const [dx, dz] of DIRS) {
+      const ni = ci + dx;
+      const nj = cj + dz;
+      if (ni < 0 || ni >= grid.gw || nj < 0 || nj >= grid.gh) continue;
+      const next = nj * grid.gw + ni;
+      if (reach[next] === 1 || blocked[next] === 1) continue;
+      reach[next] = 1;
+      stack.push(next);
+    }
+  }
+  return reach;
+}
+
+// A* barat->timur. Mulai dari kolom 0..7 mana pun yang terbuka (tepi inset
+// tetap kehitung), selesai di kolom gw-8..gw-1.
+function findPath(
+  grid: CollisionGrid,
+  blocked: Uint8Array,
+  separation: Float32Array,
+  band: Band,
+  startReach: Uint8Array,
+  goalReach: Uint8Array,
+): PathCell[] | null {
   const gScore = new Float32Array(grid.gw * grid.gh).fill(Infinity);
   const cameFrom = new Int32Array(grid.gw * grid.gh).fill(-1);
   const closed = new Uint8Array(grid.gw * grid.gh);
   const heap = new MinHeap();
+  const startMax = Math.min(8, grid.gw - 1);
+  const goalMin = Math.max(0, grid.gw - 8);
   const heuristic = (i: number, j: number) =>
-    (grid.gw - 3 - i) + Math.abs(gridCellZ(grid, j) - band.endZ) * 0.02;
+    (grid.gw - 1 - i) + Math.abs(gridCellZ(grid, j) - band.endZ) * 0.02;
 
   for (let j = 0; j < grid.gh; j++) {
-    const idx = 2 + j * grid.gw;
-    if (blocked[idx] === 1) continue; // orc hanya mulai dari area transparan
-    const cost = Math.abs(gridCellZ(grid, j) - band.center) * 0.6;
-    gScore[idx] = cost;
-    heap.push(idx, cost + heuristic(2, j));
+    for (let i = 0; i <= startMax; i++) {
+      const idx = i + j * grid.gw;
+      if (blocked[idx] === 1) continue; // orc hanya mulai dari area transparan
+      if (startReach[idx] !== 1) continue; // harus tersambung ke tepi barat
+      const cost = i * 0.12 + Math.abs(gridCellZ(grid, j) - band.center) * 0.6;
+      if (cost < gScore[idx]) {
+        gScore[idx] = cost;
+        heap.push(idx, cost + heuristic(i, j));
+      }
+    }
   }
 
   let iterations = 0;
-  while (heap.size > 0 && iterations++ < 200000) {
+  while (heap.size > 0 && iterations++ < 250000) {
     const current = heap.pop();
     if (closed[current]) continue;
     closed[current] = 1;
     const ci = current % grid.gw;
     const cj = (current - ci) / grid.gw;
-    if (ci >= grid.gw - 3) {
+    if (ci >= goalMin && goalReach[current] === 1) {
       const path: PathCell[] = [];
       let cursor: number = current;
       while (cursor >= 0) {
@@ -214,7 +303,17 @@ function findPath(grid: CollisionGrid, blocked: Uint8Array, separation: Float32A
         path.push({ i, j: (cursor - i) / grid.gw });
         cursor = cameFrom[cursor];
       }
-      return path.reverse();
+      path.reverse();
+      // Sambungkan lewat pintu: tepi->start dan goal->tepi.
+      const prefix = pathToEdge(grid, blocked, path[0], -1);
+      // pathToEdge mengembalikan urutan tepi->target; balik untuk suffix agar
+      // polyline meneruskan goal->pintu->tepi (bukan muter balik).
+      const suffix = pathToEdge(grid, blocked, path[path.length - 1], 1).reverse();
+      while (prefix.length > 0 && path.length > 0 &&
+        prefix[prefix.length - 1].i === path[0].i && prefix[prefix.length - 1].j === path[0].j) prefix.pop();
+      while (suffix.length > 0 && path.length > 0 &&
+        suffix[0].i === path[path.length - 1].i && suffix[0].j === path[path.length - 1].j) suffix.shift();
+      return [...prefix, ...path, ...suffix];
     }
     for (const [dx, dz, baseCost] of DIRS) {
       const ni = ci + dx;
@@ -255,28 +354,20 @@ const clamp = (value: number, min: number, max: number) => Math.max(min, Math.mi
 
 function laneControlsFromPath(path: readonly PathCell[], grid: CollisionGrid): TrackControl[] {
   const points = path.map((cell) => [gridCellX(grid, cell.i), gridCellZ(grid, cell.j)] as TrackControl);
-  const corners: TrackControl[] = [points[0]];
+  // Buang hanya titik yang benar-benar segaris (arah sama persis) agar kurva
+  // Catmull-Rom menempel poliline dan tidak meleset menembus tembok di
+  // tikungan tajam seperti mulut pintu.
+  const dense: TrackControl[] = [points[0]];
   for (let k = 1; k < points.length - 1; k++) {
-    const [ax, az] = points[k - 1];
+    const [ax, az] = dense[dense.length - 1];
     const [bx, bz] = points[k];
     const [cx, cz] = points[k + 1];
-    const turn = Math.sign(bx - ax) !== Math.sign(cx - bx) || Math.sign(bz - az) !== Math.sign(cz - bz);
-    const sharp = Math.abs((cx - bx) * (bz - az) - (bx - ax) * (cz - bz)) > 0.5;
-    if (turn || sharp) corners.push(points[k]);
+    const sameLine = (bx - ax) * (cz - bz) === (cx - bx) * (bz - az) &&
+      Math.sign(bx - ax) === Math.sign(cx - bx) && Math.sign(bz - az) === Math.sign(cz - bz);
+    if (sameLine) continue;
+    dense.push(points[k]);
   }
-  corners.push(points[points.length - 1]);
-  const dense: TrackControl[] = [];
-  for (let k = 0; k < corners.length - 1; k++) {
-    const [ax, az] = corners[k];
-    const [bx, bz] = corners[k + 1];
-    const distance = Math.hypot(bx - ax, bz - az);
-    dense.push(corners[k]);
-    const steps = Math.floor(distance / 15);
-    for (let s = 1; s <= steps; s++) {
-      dense.push([ax + (bx - ax) * s / (steps + 1), az + (bz - az) * s / (steps + 1)]);
-    }
-  }
-  dense.push(corners[corners.length - 1]);
+  dense.push(points[points.length - 1]);
   const startZ = clamp(dense[0][1], -grid.halfZ + 8, grid.halfZ - 8);
   const endZ = clamp(dense[dense.length - 1][1], -grid.halfZ + 8, grid.halfZ - 8);
   return [
@@ -328,12 +419,13 @@ export interface LanesFromGridResult {
   lanes: RaidLane[];
   carved: CollisionGrid;
   rejected: boolean;
+  pathFound: number;
 }
 
 // Logika murni (tanpa DOM) — bisa diuji di Node.
 export function buildLanesFromWalls(grid: CollisionGrid): LanesFromGridResult {
   const transparent = Uint8Array.from(grid.walls, (value) => (value === 1 ? 0 : 1));
-  const blocked = inflateWalls(grid, transparent);
+  const inflated = inflateWalls(grid, transparent);
   const separation = new Float32Array(grid.gw * grid.gh);
   const scaleZ = grid.halfZ / 60;
   const bands = BASE_BANDS.map((band) => ({
@@ -341,21 +433,51 @@ export function buildLanesFromWalls(grid: CollisionGrid): LanesFromGridResult {
     center: band.center * scaleZ,
     endZ: band.endZ * scaleZ,
   }));
-  const lanes: RaidLane[] = [];
+  const foundControls: (TrackControl[] | null)[] = [];
+  const bandCenters = bands.map((band) => band.center);
   let pathFound = 0;
-  for (const band of bands) {
-    const path = findPath(grid, blocked, separation, band);
-    const controls = path ? laneControlsFromPath(path, grid) : straightControls(band, grid);
+  for (let index = 0; index < bands.length; index++) {
+    const band = bands[index];
+    // Coba dulu dengan dinding tergembung (orc nyaman), lalu longgar (dinding
+    // mentah) — koridor sempit 1-2 sel tetap bisa dilalui.
+    const startReach = edgeReachable(grid, inflated, -1);
+    const startLoose = edgeReachable(grid, grid.walls, -1);
+    const goalReach = edgeReachable(grid, inflated, 1);
+    const goalLoose = edgeReachable(grid, grid.walls, 1);
+    const path =
+      findPath(grid, inflated, separation, band, startReach, goalReach) ??
+      findPath(grid, grid.walls, separation, band, startLoose, goalLoose);
     if (path) {
       pathFound++;
+      foundControls[index] = laneControlsFromPath(path, grid);
       addSeparation(separation, grid, path);
     }
-    lanes.push({ id: band.id, label: band.label, controls });
   }
+  // Band tanpa rute memakai jalur band yang berhasil (terdekat di sumbu z)
+  // alih-alih mengukir lorong sendiri menembus tembok.
+  for (let index = 0; index < bands.length; index++) {
+    if (foundControls[index]) continue;
+    let nearest = -1;
+    let nearestDistance = Infinity;
+    for (let other = 0; other < bands.length; other++) {
+      if (!foundControls[other]) continue;
+      const distance = Math.abs(bandCenters[other] - bandCenters[index]);
+      if (distance < nearestDistance) {
+        nearestDistance = distance;
+        nearest = other;
+      }
+    }
+    foundControls[index] = nearest >= 0 ? foundControls[nearest] : straightControls(bands[index], grid);
+  }
+  const lanes: RaidLane[] = bands.map((band, index) => ({
+    id: band.id,
+    label: band.label,
+    controls: foundControls[index]!,
+  }));
   // Tidak ada satu pun rute barat->timur di area transparan -> peta ditolak.
   const rejected = pathFound === 0;
   const carvedGrid: CollisionGrid = rejected ? grid : { ...grid, walls: carveWalls(grid, lanes) };
-  return { lanes, carved: carvedGrid, rejected };
+  return { lanes, carved: carvedGrid, rejected, pathFound };
 }
 
 function loadImageElement(src: string) {
@@ -365,38 +487,6 @@ function loadImageElement(src: string) {
     image.onerror = () => reject(new Error("Gagal memuat gambar"));
     image.src = src;
   });
-}
-
-function decodeDataUrlText(dataUrl: string) {
-  const comma = dataUrl.indexOf(",");
-  const payload = dataUrl.slice(comma + 1);
-  if (dataUrl.includes(";base64")) {
-    const binary = atob(payload);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return new TextDecoder().decode(bytes);
-  }
-  return decodeURIComponent(payload);
-}
-
-// PNG/JPG tanpa dimensi bermasalah tetap dirasterisasi pada ukuran aslinya.
-async function normalizeImageSource(dataUrl: string) {
-  if (!dataUrl.includes("image/svg")) return dataUrl;
-  let text: string;
-  try {
-    text = decodeDataUrlText(dataUrl);
-  } catch {
-    return dataUrl;
-  }
-  const head = text.slice(0, text.indexOf(">") + 1);
-  const hasWidth = /\swidth\s*=\s*["']/i.test(head);
-  const hasHeight = /\sheight\s*=\s*["']/i.test(head);
-  if (hasWidth && hasHeight) return dataUrl;
-  const viewBox = head.match(/viewBox\s*=\s*["']\s*([-\d.]+)[,\s]+([-\d.]+)[,\s]+([-\d.]+)[,\s]+([-\d.]+)/i);
-  const width = viewBox ? Math.max(1, Math.round(parseFloat(viewBox[3]))) : 1024;
-  const height = viewBox ? Math.max(1, Math.round(parseFloat(viewBox[4]))) : 1024;
-  const patched = text.replace(/<svg/i, `<svg width="${width}" height="${height}"`);
-  return "data:image/svg+xml;charset=utf-8," + encodeURIComponent(patched);
 }
 
 // Ukuran arena mengikuti aspek gambar, dengan luas total tetap ~160x120 unit.
@@ -412,13 +502,24 @@ export function arenaSizeForImage(width: number, height: number) {
   return { halfX, halfZ, gw, gh };
 }
 
-function rasterizeToWalls(image: HTMLImageElement, gw: number, gh: number) {
+// Rasterisasi gambar (dengan rotasi opsional 0/90/180/270) ke grid dinding.
+// Mode otomatis: PNG transparan -> opaque = dinding, transparan = jalur.
+// PNG/JPG padat -> area GELAP = dinding, area TERANG = jalur.
+function rasterizeToWalls(image: HTMLImageElement, gw: number, gh: number, rotation: number) {
   const supersample = 4;
   const canvas = document.createElement("canvas");
   canvas.width = gw * supersample;
   canvas.height = gh * supersample;
   const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
-  ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+  ctx.save();
+  ctx.translate(canvas.width / 2, canvas.height / 2);
+  ctx.rotate((rotation * Math.PI) / 180);
+  // Kotak gambar diputar menutupi kanvas: dims ditukar untuk rotasi 90/270.
+  const swap = rotation % 180 !== 0;
+  const boxW = swap ? canvas.height : canvas.width;
+  const boxH = swap ? canvas.width : canvas.height;
+  ctx.drawImage(image, -boxW / 2, -boxH / 2, boxW, boxH);
+  ctx.restore();
   const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
 
   const subPerCell = supersample * supersample;
@@ -432,7 +533,7 @@ function rasterizeToWalls(image: HTMLImageElement, gw: number, gh: number) {
         for (let si = 0; si < supersample; si++) {
           const px = ((j * supersample + sj) * canvas.width + i * supersample + si) * 4;
           const alpha = data[px + 3];
-          if (alpha <= 60) continue;
+          if (alpha <= 90) continue; // ambang longgar: alpha 0-90 dianggap jalur
           opaqueTotal++;
           wallHits++;
         }
@@ -441,8 +542,6 @@ function rasterizeToWalls(image: HTMLImageElement, gw: number, gh: number) {
     }
   }
 
-  // PNG dengan transparansi -> area OPAQUE = dinding, area TRANSPARAN = jalur orc.
-  // PNG/JPG padat (tanpa alpha) -> otomatis: area GELAP = dinding, area TERANG = jalur.
   const inverted = opaqueTotal / totalSubpixels > 0.62;
   if (inverted) {
     for (let j = 0; j < gh; j++) {
@@ -451,19 +550,25 @@ function rasterizeToWalls(image: HTMLImageElement, gw: number, gh: number) {
         for (let sj = 0; sj < supersample; sj++) {
           for (let si = 0; si < supersample; si++) {
             const px = ((j * supersample + sj) * canvas.width + i * supersample + si) * 4;
-            if (data[px + 3] <= 60) continue;
+            if (data[px + 3] <= 90) continue;
             const luminance = 0.299 * data[px] + 0.587 * data[px + 1] + 0.114 * data[px + 2];
-            if (luminance < 105) wallHits++;
+            if (luminance < 112) wallHits++;
           }
         }
         wallSubpixels[j * gw + i] = wallHits;
       }
     }
   }
-  const threshold = Math.max(3, Math.floor(subPerCell * 0.25));
+  const threshold = Math.max(3, Math.floor(subPerCell * 0.22));
   const walls = new Uint8Array(gw * gh);
-  for (let k = 0; k < walls.length; k++) walls[k] = wallSubpixels[k] >= threshold ? 1 : 0;
-  return { walls, inverted };
+  let openCount = 0;
+  for (let k = 0; k < walls.length; k++) {
+    walls[k] = wallSubpixels[k] >= threshold ? 1 : 0;
+    if (walls[k] === 0) openCount++;
+  }
+  let opaquePercent = 0;
+  for (let k = 0; k < wallSubpixels.length; k++) if (wallSubpixels[k] >= threshold) opaquePercent++;
+  return { walls, inverted, openFraction: openCount / walls.length, opaquePercent };
 }
 
 export interface SvgMapResult {
@@ -473,23 +578,69 @@ export interface SvgMapResult {
   image: HTMLImageElement;
   width: number;
   height: number;
+  rotation: number; // rotasi yang dipakai agar jalur barat->timur tersambung
 }
 
-export async function loadSvgMap(dataUrl: string): Promise<SvgMapResult | null> {
-  const source = await normalizeImageSource(dataUrl);
-  const image = await loadImageElement(source);
-  const size = arenaSizeForImage(image.naturalWidth || image.width, image.naturalHeight || image.height);
-  const raw = rasterizeToWalls(image, size.gw, size.gh);
-  const grid: CollisionGrid = {
-    walls: raw.walls,
-    gw: size.gw,
-    gh: size.gh,
-    halfX: size.halfX,
-    halfZ: size.halfZ,
-    startX: -(size.halfX + 12),
-    endX: size.halfX + 10,
-  };
-  const built = buildLanesFromWalls(grid);
-  if (built.rejected) return null;
-  return { lanes: built.lanes, grid: built.carved, inverted: raw.inverted, image, width: image.naturalWidth, height: image.naturalHeight };
+export interface SvgMapFailure {
+  ok: false;
+  reason: string;
+}
+
+export interface SvgMapSuccess extends SvgMapResult {
+  ok: true;
+}
+
+// Coba semua rotasi kuartal; kembalikan hasil pertama yang punya rute.
+export async function loadSvgMap(dataUrl: string): Promise<SvgMapSuccess | SvgMapFailure> {
+  const image = await loadImageElement(dataUrl);
+  const imgW = image.naturalWidth || image.width;
+  const imgH = image.naturalHeight || image.height;
+  let lastDiagnostics = "";
+  for (const rotation of [0, 90, 180, 270]) {
+    const swap = rotation % 180 !== 0;
+    const size = arenaSizeForImage(swap ? imgH : imgW, swap ? imgW : imgH);
+    const raster = rasterizeToWalls(image, size.gw, size.gh, rotation);
+    const grid: CollisionGrid = {
+      walls: raster.walls,
+      gw: size.gw,
+      gh: size.gh,
+      halfX: size.halfX,
+      halfZ: size.halfZ,
+      startX: -(size.halfX + 12),
+      endX: size.halfX + 10,
+    };
+    const built = buildLanesFromWalls(grid);
+    if (!built.rejected) {
+      return {
+        ok: true,
+        lanes: built.lanes,
+        grid: built.carved,
+        inverted: raster.inverted,
+        image,
+        width: imgW,
+        height: imgH,
+        rotation,
+      };
+    }
+    // Diagnostik dari percobaan terbaik (rotasi 0 / orientasi asli).
+    if (rotation === 0) {
+      let westOpen = 0;
+      let eastOpen = 0;
+      for (let j = 0; j < grid.gh; j++) {
+        if (grid.walls[j * grid.gw] === 0) westOpen++;
+        if (grid.walls[j * grid.gw + grid.gw - 1] === 0) eastOpen++;
+      }
+      const pct = Math.round(raster.openFraction * 100);
+      if (raster.openFraction < 0.04) {
+        lastDiagnostics = `hanya ${pct}% area terbuka — hampir seluruh PNG tertutup/terang. Buka area transparan yang menyambung kiri ke kanan.`;
+      } else if (westOpen === 0 && eastOpen === 0) {
+        lastDiagnostics = `${pct}% area terbuka, tapi tidak ada lubang transparan di tepi KIRI maupun KANAN. Gambar pintu masuk di tepi kiri & keluar di tepi kanan.`;
+      } else if (westOpen === 0 || eastOpen === 0) {
+        lastDiagnostics = `${pct}% area terbuka, tapi ${westOpen === 0 ? "tepi KIRI tertutup" : "tepi KANAN tertutup"} — orc tidak punya jalan masuk/keluar.`;
+      } else {
+        lastDiagnostics = `${pct}% area terbuka & tepi kiri/kanan bolong, tapi tidak tersambung (dipisah dinding). Sambungkan area transparan dari kiri ke kanan, atau perlebar koridor sempit (min ~3 sel / 6 unit).`;
+      }
+    }
+  }
+  return { ok: false, reason: lastDiagnostics };
 }
