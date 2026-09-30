@@ -1,10 +1,72 @@
 import * as THREE from "three";
-import { LANE_END_X, LANE_START_X, type LaneId, type RaidLane, type TrackControl } from "./TrackGenerator";
+import type { LaneId, RaidLane, TrackControl } from "./TrackGenerator";
 
-// Grid collision peta SVG: mencakup arena -80..80 (X) dan -60..60 (Z), tiap sel 2x2 unit.
-export const SVG_GRID_W = 80;
-export const SVG_GRID_H = 60;
+// Grid collision dinamis: ukuran arena mengikuti aspek PNG yang diunggah.
 export const SVG_CELL = 2;
+
+export interface CollisionGrid {
+  walls: Uint8Array; // 1 = solid (tidak bisa dilewati orc / turret)
+  gw: number; // jumlah kolom sel
+  gh: number; // jumlah baris sel
+  halfX: number; // setengah lebar arena (unit dunia)
+  halfZ: number; // setengah tinggi arena (unit dunia)
+  startX: number; // tepi barat luar arena (titik spawn orc)
+  endX: number; // tepi timur luar arena (arah benteng)
+}
+
+export function gridCellX(grid: CollisionGrid, i: number) {
+  return -grid.halfX + (i + 0.5) * SVG_CELL;
+}
+
+export function gridCellZ(grid: CollisionGrid, j: number) {
+  return -grid.halfZ + (j + 0.5) * SVG_CELL;
+}
+
+export function gridIsWall(grid: CollisionGrid, x: number, z: number) {
+  const i = Math.floor((x + grid.halfX) / SVG_CELL);
+  const j = Math.floor((z + grid.halfZ) / SVG_CELL);
+  if (i < 0 || i >= grid.gw || j < 0 || j >= grid.gh) return false;
+  return grid.walls[j * grid.gw + i] === 1;
+}
+
+// Ada dinding dalam radius `radius` dari titik (validasi penempatan turret).
+export function gridBlocked(grid: CollisionGrid, x: number, z: number, radius: number) {
+  const iMin = Math.max(0, Math.floor((x - radius + grid.halfX) / SVG_CELL));
+  const iMax = Math.min(grid.gw - 1, Math.floor((x + radius + grid.halfX) / SVG_CELL));
+  const jMin = Math.max(0, Math.floor((z - radius + grid.halfZ) / SVG_CELL));
+  const jMax = Math.min(grid.gh - 1, Math.floor((z + radius + grid.halfZ) / SVG_CELL));
+  for (let j = jMin; j <= jMax; j++) {
+    for (let i = iMin; i <= iMax; i++) {
+      if (grid.walls[j * grid.gw + i] !== 1) continue;
+      const minX = gridCellX(grid, i) - 1;
+      const maxX = gridCellX(grid, i) + 1;
+      const minZ = gridCellZ(grid, j) - 1;
+      const maxZ = gridCellZ(grid, j) + 1;
+      const cx = Math.max(minX, Math.min(maxX, x));
+      const cz = Math.max(minZ, Math.min(maxZ, z));
+      if ((cx - x) ** 2 + (cz - z) ** 2 < radius * radius) return true;
+    }
+  }
+  return false;
+}
+
+// Dorong tubuh (orc/mayat) keluar dari sel dinding di sekitarnya.
+export function gridCollide(
+  grid: CollisionGrid,
+  body: { x: number; z: number },
+  resolve: (x: number, z: number, radius: number) => boolean,
+) {
+  const i0 = Math.floor((body.x + grid.halfX) / SVG_CELL);
+  const j0 = Math.floor((body.z + grid.halfZ) / SVG_CELL);
+  for (let j = j0 - 1; j <= j0 + 1; j++) {
+    if (j < 0 || j >= grid.gh) continue;
+    for (let i = i0 - 1; i <= i0 + 1; i++) {
+      if (i < 0 || i >= grid.gw) continue;
+      if (grid.walls[j * grid.gw + i] !== 1) continue;
+      resolve(gridCellX(grid, i), gridCellZ(grid, j), 1.24);
+    }
+  }
+}
 
 const SQRT2 = Math.SQRT2;
 
@@ -15,72 +77,13 @@ interface Band {
   endZ: number;
 }
 
-// Empat pita z yang sama dengan generator prosedural, agar jalur tetap terpisah rapi.
-const BANDS: Band[] = [
+// Pita z dasar (skala 60); dikalikan dengan halfZ aktual saat pemuatan.
+const BASE_BANDS: Band[] = [
   { id: "north", label: "UTARA", center: -38, endZ: -33 },
   { id: "midNorth", label: "TENGAH ATAS", center: -14.5, endZ: -13 },
   { id: "midSouth", label: "TENGAH BAWAH", center: 14.5, endZ: 13 },
   { id: "south", label: "SELATAN", center: 38, endZ: 33 },
 ];
-
-export function svgCellX(i: number) {
-  return -80 + (i + 0.5) * SVG_CELL;
-}
-
-export function svgCellZ(j: number) {
-  return -60 + (j + 0.5) * SVG_CELL;
-}
-
-export function svgIsWall(walls: Uint8Array, x: number, z: number) {
-  const i = Math.floor((x + 80) / SVG_CELL);
-  const j = Math.floor((z + 60) / SVG_CELL);
-  if (i < 0 || i >= SVG_GRID_W || j < 0 || j >= SVG_GRID_H) return false;
-  return walls[j * SVG_GRID_W + i] === 1;
-}
-
-// Ada dinding dalam radius `radius` dari titik (untuk validasi penempatan turret).
-export function svgBlocked(walls: Uint8Array, x: number, z: number, radius: number) {
-  const iMin = Math.max(0, Math.floor((x - radius + 80) / SVG_CELL));
-  const iMax = Math.min(SVG_GRID_W - 1, Math.floor((x + radius + 80) / SVG_CELL));
-  const jMin = Math.max(0, Math.floor((z - radius + 60) / SVG_CELL));
-  const jMax = Math.min(SVG_GRID_H - 1, Math.floor((z + radius + 60) / SVG_CELL));
-  for (let j = jMin; j <= jMax; j++) {
-    for (let i = iMin; i <= iMax; i++) {
-      if (walls[j * SVG_GRID_W + i] !== 1) continue;
-      const minX = svgCellX(i) - 1;
-      const maxX = svgCellX(i) + 1;
-      const minZ = svgCellZ(j) - 1;
-      const maxZ = svgCellZ(j) + 1;
-      const cx = Math.max(minX, Math.min(maxX, x));
-      const cz = Math.max(minZ, Math.min(maxZ, z));
-      if ((cx - x) ** 2 + (cz - z) ** 2 < radius * radius) return true;
-    }
-  }
-  return false;
-}
-
-// Dorong tubuh (orc/mayat) keluar dari sel dinding di sekitarnya.
-export function svgCollideWalls(
-  walls: Uint8Array,
-  body: { x: number; z: number },
-  resolve: (x: number, z: number, radius: number) => boolean,
-) {
-  const i0 = Math.floor((body.x + 80) / SVG_CELL);
-  const j0 = Math.floor((body.z + 60) / SVG_CELL);
-  for (let j = j0 - 1; j <= j0 + 1; j++) {
-    if (j < 0 || j >= SVG_GRID_H) continue;
-    for (let i = i0 - 1; i <= i0 + 1; i++) {
-      if (i < 0 || i >= SVG_GRID_W) continue;
-      if (walls[j * SVG_GRID_W + i] !== 1) continue;
-      resolve(svgCellX(i), svgCellZ(j), 1.24);
-    }
-  }
-}
-
-interface PathCell {
-  i: number;
-  j: number;
-}
 
 class MinHeap {
   private items: number[] = [];
@@ -134,34 +137,36 @@ class MinHeap {
   }
 }
 
-function inflateWalls(walls: Uint8Array) {
-  const out = new Uint8Array(walls.length);
-  for (let j = 0; j < SVG_GRID_H; j++) {
-    for (let i = 0; i < SVG_GRID_W; i++) {
-      if (walls[j * SVG_GRID_W + i] === 1) {
-        out[j * SVG_GRID_W + i] = 1;
-        continue;
-      }
+function inflateWalls(grid: CollisionGrid, transparent: Uint8Array) {
+  const out = new Uint8Array(grid.walls);
+  for (let j = 0; j < grid.gh; j++) {
+    for (let i = 0; i < grid.gw; i++) {
+      const cell = j * grid.gw + i;
+      if (out[cell] === 1) continue;
       let blocked = 0;
       for (let dj = -1; dj <= 1 && !blocked; dj++) {
         const jj = j + dj;
-        if (jj < 0 || jj >= SVG_GRID_H) continue;
+        if (jj < 0 || jj >= grid.gh) continue;
         for (let di = -1; di <= 1; di++) {
           const ii = i + di;
-          if (ii < 0 || ii >= SVG_GRID_W) continue;
-          if (walls[jj * SVG_GRID_W + ii] === 1) {
+          if (ii < 0 || ii >= grid.gw) continue;
+          if (grid.walls[jj * grid.gw + ii] === 1) {
             blocked = 1;
             break;
           }
         }
       }
-      out[j * SVG_GRID_W + i] = blocked;
+      out[cell] = blocked;
     }
   }
-  // Tepi barat & timur dipaksa terbuka agar jalur selalu bisa mulai dan selesai.
-  for (let j = 0; j < SVG_GRID_H; j++) {
-    for (const i of [0, 1, 2, SVG_GRID_W - 3, SVG_GRID_W - 2, SVG_GRID_W - 1]) {
-      out[j * SVG_GRID_W + i] = 0;
+  // Pintu masuk/keluar HANYA di sel tepi yang transparan pada PNG aslinya:
+  // orc masuk lewat area terbuka yang menyentuh tepi barat, keluar di tepi timur.
+  for (let j = 0; j < grid.gh; j++) {
+    for (let i = 0; i < 3; i++) {
+      if (transparent[j * grid.gw + i] === 1) out[j * grid.gw + i] = 0;
+    }
+    for (let i = grid.gw - 3; i < grid.gw; i++) {
+      if (transparent[j * grid.gw + i] === 1) out[j * grid.gw + i] = 0;
     }
   }
   return out;
@@ -173,34 +178,40 @@ const DIRS: readonly (readonly [number, number, number])[] = [
   [-1, 1, SQRT2], [-1, 0, 1], [-1, -1, SQRT2],
 ];
 
-function findPath(blocked: Uint8Array, separation: Float32Array, band: Band): PathCell[] | null {
-  const gScore = new Float32Array(SVG_GRID_W * SVG_GRID_H).fill(Infinity);
-  const cameFrom = new Int32Array(SVG_GRID_W * SVG_GRID_H).fill(-1);
-  const closed = new Uint8Array(SVG_GRID_W * SVG_GRID_H);
+interface PathCell {
+  i: number;
+  j: number;
+}
+
+function findPath(grid: CollisionGrid, blocked: Uint8Array, separation: Float32Array, band: Band): PathCell[] | null {
+  const gScore = new Float32Array(grid.gw * grid.gh).fill(Infinity);
+  const cameFrom = new Int32Array(grid.gw * grid.gh).fill(-1);
+  const closed = new Uint8Array(grid.gw * grid.gh);
   const heap = new MinHeap();
   const heuristic = (i: number, j: number) =>
-    (SVG_GRID_W - 3 - i) + Math.abs(svgCellZ(j) - band.endZ) * 0.02;
+    (grid.gw - 3 - i) + Math.abs(gridCellZ(grid, j) - band.endZ) * 0.02;
 
-  for (let j = 0; j < SVG_GRID_H; j++) {
-    const idx = 2 + j * SVG_GRID_W;
-    const cost = Math.abs(svgCellZ(j) - band.center) * 0.6;
+  for (let j = 0; j < grid.gh; j++) {
+    const idx = 2 + j * grid.gw;
+    if (blocked[idx] === 1) continue; // orc hanya mulai dari area transparan
+    const cost = Math.abs(gridCellZ(grid, j) - band.center) * 0.6;
     gScore[idx] = cost;
     heap.push(idx, cost + heuristic(2, j));
   }
 
   let iterations = 0;
-  while (heap.size > 0 && iterations++ < 90000) {
+  while (heap.size > 0 && iterations++ < 200000) {
     const current = heap.pop();
     if (closed[current]) continue;
     closed[current] = 1;
-    const ci = current % SVG_GRID_W;
-    const cj = (current - ci) / SVG_GRID_W;
-    if (ci >= SVG_GRID_W - 3) {
+    const ci = current % grid.gw;
+    const cj = (current - ci) / grid.gw;
+    if (ci >= grid.gw - 3) {
       const path: PathCell[] = [];
       let cursor: number = current;
       while (cursor >= 0) {
-        const i = cursor % SVG_GRID_W;
-        path.push({ i, j: (cursor - i) / SVG_GRID_W });
+        const i = cursor % grid.gw;
+        path.push({ i, j: (cursor - i) / grid.gw });
         cursor = cameFrom[cursor];
       }
       return path.reverse();
@@ -208,12 +219,11 @@ function findPath(blocked: Uint8Array, separation: Float32Array, band: Band): Pa
     for (const [dx, dz, baseCost] of DIRS) {
       const ni = ci + dx;
       const nj = cj + dz;
-      if (ni < 0 || ni >= SVG_GRID_W || nj < 0 || nj >= SVG_GRID_H) continue;
-      const next = nj * SVG_GRID_W + ni;
+      if (ni < 0 || ni >= grid.gw || nj < 0 || nj >= grid.gh) continue;
+      const next = nj * grid.gw + ni;
       if (closed[next] || blocked[next] === 1) continue;
-      // Diagonal hanya boleh jika kedua orthogonalthya terbuka (tanpa menyobek sudut dinding).
-      if (dx !== 0 && dz !== 0 && (blocked[cj * SVG_GRID_W + ni] === 1 || blocked[nj * SVG_GRID_W + ci] === 1)) continue;
-      const centerPull = Math.abs(svgCellZ(nj) - band.center) * 0.045;
+      if (dx !== 0 && dz !== 0 && (blocked[cj * grid.gw + ni] === 1 || blocked[nj * grid.gw + ci] === 1)) continue;
+      const centerPull = Math.abs(gridCellZ(grid, nj) - band.center) * 0.045;
       const cost = gScore[current] + baseCost + separation[next] + centerPull;
       if (cost < gScore[next] - 1e-4) {
         gScore[next] = cost;
@@ -225,17 +235,17 @@ function findPath(blocked: Uint8Array, separation: Float32Array, band: Band): Pa
   return null;
 }
 
-function addSeparation(separation: Float32Array, path: readonly PathCell[]) {
+function addSeparation(separation: Float32Array, grid: CollisionGrid, path: readonly PathCell[]) {
   for (let k = 0; k < path.length; k += 2) {
     const { i, j } = path[k];
     for (let dj = -5; dj <= 5; dj++) {
       const jj = j + dj;
-      if (jj < 0 || jj >= SVG_GRID_H) continue;
+      if (jj < 0 || jj >= grid.gh) continue;
       for (let di = -5; di <= 5; di++) {
         const ii = i + di;
-        if (ii < 0 || ii >= SVG_GRID_W) continue;
+        if (ii < 0 || ii >= grid.gw) continue;
         const d = Math.hypot(di, dj);
-        if (d <= 5.5) separation[jj * SVG_GRID_W + ii] += (5.5 - d) * 26;
+        if (d <= 5.5) separation[jj * grid.gw + ii] += (5.5 - d) * 26;
       }
     }
   }
@@ -243,9 +253,8 @@ function addSeparation(separation: Float32Array, path: readonly PathCell[]) {
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 
-function laneControlsFromPath(path: readonly PathCell[]): TrackControl[] {
-  const points = path.map((cell) => [svgCellX(cell.i), svgCellZ(cell.j)] as TrackControl);
-  // Sederhanakan: simpan hanya tikungan.
+function laneControlsFromPath(path: readonly PathCell[], grid: CollisionGrid): TrackControl[] {
+  const points = path.map((cell) => [gridCellX(grid, cell.i), gridCellZ(grid, cell.j)] as TrackControl);
   const corners: TrackControl[] = [points[0]];
   for (let k = 1; k < points.length - 1; k++) {
     const [ax, az] = points[k - 1];
@@ -256,7 +265,6 @@ function laneControlsFromPath(path: readonly PathCell[]): TrackControl[] {
     if (turn || sharp) corners.push(points[k]);
   }
   corners.push(points[points.length - 1]);
-  // Percahkan lagi bila jarak antar tikungan terlalu jauh (jaga kurva halus).
   const dense: TrackControl[] = [];
   for (let k = 0; k < corners.length - 1; k++) {
     const [ax, az] = corners[k];
@@ -269,22 +277,28 @@ function laneControlsFromPath(path: readonly PathCell[]): TrackControl[] {
     }
   }
   dense.push(corners[corners.length - 1]);
-  const startZ = clamp(dense[0][1], -46, 46);
-  const endZ = clamp(dense[dense.length - 1][1], -46, 46);
-  return [[LANE_START_X, startZ], [-84, startZ], ...dense, [84, endZ], [LANE_END_X, endZ]];
+  const startZ = clamp(dense[0][1], -grid.halfZ + 8, grid.halfZ - 8);
+  const endZ = clamp(dense[dense.length - 1][1], -grid.halfZ + 8, grid.halfZ - 8);
+  return [
+    [grid.startX, startZ], [grid.startX + 8, startZ],
+    ...dense,
+    [grid.endX - 6, endZ], [grid.endX, endZ],
+  ];
 }
 
-function straightControls(band: Band): TrackControl[] {
-  const z = clamp(band.center, -46, 46);
+function straightControls(band: Band, grid: CollisionGrid): TrackControl[] {
+  const z = clamp(band.center, -grid.halfZ + 8, grid.halfZ - 8);
+  const span = grid.halfX * 2;
   return [
-    [LANE_START_X, z], [-70, z], [-45, z], [-20, z], [5, z],
-    [30, z], [55, z], [78, z], [LANE_END_X, clamp(band.endZ, -46, 46)],
+    [grid.startX, z], [grid.startX + span * 0.16, z], [grid.startX + span * 0.33, z],
+    [grid.startX + span * 0.5, z], [grid.startX + span * 0.66, z], [grid.startX + span * 0.84, z],
+    [grid.endX, clamp(band.endZ, -grid.halfZ + 8, grid.halfZ - 8)],
   ];
 }
 
 // Buka koridor selebar jalan di sepanjang setiap lajur agar orc tidak pernah macet.
-function carveWalls(walls: Uint8Array, lanes: readonly RaidLane[]) {
-  const out = Uint8Array.from(walls);
+function carveWalls(grid: CollisionGrid, lanes: readonly RaidLane[]) {
+  const carved = Uint8Array.from(grid.walls);
   for (const lane of lanes) {
     const curve = new THREE.CatmullRomCurve3(
       lane.controls.map(([x, z]) => new THREE.Vector3(x, 0, z)),
@@ -294,50 +308,54 @@ function carveWalls(walls: Uint8Array, lanes: readonly RaidLane[]) {
     );
     const points = curve.getSpacedPoints(150);
     for (const point of points) {
-      const ci = Math.floor((point.x + 80) / SVG_CELL);
-      const cj = Math.floor((point.z + 60) / SVG_CELL);
+      const ci = Math.floor((point.x + grid.halfX) / SVG_CELL);
+      const cj = Math.floor((point.z + grid.halfZ) / SVG_CELL);
       for (let dj = -3; dj <= 3; dj++) {
         const j = cj + dj;
-        if (j < 0 || j >= SVG_GRID_H) continue;
+        if (j < 0 || j >= grid.gh) continue;
         for (let di = -3; di <= 3; di++) {
           const i = ci + di;
-          if (i < 0 || i >= SVG_GRID_W) continue;
-          if (Math.hypot(svgCellX(i) - point.x, svgCellZ(j) - point.z) <= 5.3) out[j * SVG_GRID_W + i] = 0;
+          if (i < 0 || i >= grid.gw) continue;
+          if (Math.hypot(gridCellX(grid, i) - point.x, gridCellZ(grid, j) - point.z) <= 5.3) carved[j * grid.gw + i] = 0;
         }
       }
     }
   }
-  return out;
+  return carved;
 }
 
-export interface SvgLanesResult {
+export interface LanesFromGridResult {
   lanes: RaidLane[];
-  carved: Uint8Array;
+  carved: CollisionGrid;
   rejected: boolean;
 }
 
 // Logika murni (tanpa DOM) — bisa diuji di Node.
-export function buildLanesFromWalls(walls: Uint8Array): SvgLanesResult {
-  let openCount = 0;
-  for (let k = 0; k < walls.length; k++) if (walls[k] === 0) openCount++;
-  const openFraction = openCount / walls.length;
-  const blocked = inflateWalls(walls);
-  const separation = new Float32Array(SVG_GRID_W * SVG_GRID_H);
+export function buildLanesFromWalls(grid: CollisionGrid): LanesFromGridResult {
+  const transparent = Uint8Array.from(grid.walls, (value) => (value === 1 ? 0 : 1));
+  const blocked = inflateWalls(grid, transparent);
+  const separation = new Float32Array(grid.gw * grid.gh);
+  const scaleZ = grid.halfZ / 60;
+  const bands = BASE_BANDS.map((band) => ({
+    ...band,
+    center: band.center * scaleZ,
+    endZ: band.endZ * scaleZ,
+  }));
   const lanes: RaidLane[] = [];
   let pathFound = 0;
-  for (const band of BANDS) {
-    const path = findPath(blocked, separation, band);
-    const controls = path ? laneControlsFromPath(path) : straightControls(band);
+  for (const band of bands) {
+    const path = findPath(grid, blocked, separation, band);
+    const controls = path ? laneControlsFromPath(path, grid) : straightControls(band, grid);
     if (path) {
       pathFound++;
-      addSeparation(separation, path);
+      addSeparation(separation, grid, path);
     }
     lanes.push({ id: band.id, label: band.label, controls });
   }
-  // Peta nyaris solid penuh tanpa satu pun rute -> tolak.
-  const rejected = pathFound === 0 && openFraction < 0.1;
-  if (rejected) return { lanes, carved: walls, rejected };
-  return { lanes, carved: carveWalls(walls, lanes), rejected: false };
+  // Tidak ada satu pun rute barat->timur di area transparan -> peta ditolak.
+  const rejected = pathFound === 0;
+  const carvedGrid: CollisionGrid = rejected ? grid : { ...grid, walls: carveWalls(grid, lanes) };
+  return { lanes, carved: carvedGrid, rejected };
 }
 
 function loadImageElement(src: string) {
@@ -361,7 +379,7 @@ function decodeDataUrlText(dataUrl: string) {
   return decodeURIComponent(payload);
 }
 
-// SVG tanpa width/height (hanya viewBox) sering gagal dirasterisasi — tambahkan atributnya.
+// PNG/JPG tanpa dimensi bermasalah tetap dirasterisasi pada ukuran aslinya.
 async function normalizeImageSource(dataUrl: string) {
   if (!dataUrl.includes("image/svg")) return dataUrl;
   let text: string;
@@ -381,21 +399,34 @@ async function normalizeImageSource(dataUrl: string) {
   return "data:image/svg+xml;charset=utf-8," + encodeURIComponent(patched);
 }
 
-function rasterizeToWalls(image: HTMLImageElement) {
+// Ukuran arena mengikuti aspek gambar, dengan luas total tetap ~160x120 unit.
+export function arenaSizeForImage(width: number, height: number) {
+  const area = 160 * 120;
+  const aspect = Math.max(0.4, Math.min(2.6, width / Math.max(1, height)));
+  let halfX = clamp(Math.sqrt(area * aspect) / 2, 55, 108);
+  let halfZ = clamp(Math.sqrt(area / aspect) / 2, 40, 78);
+  const gw = Math.max(50, Math.round(halfX * 2 / SVG_CELL));
+  const gh = Math.max(36, Math.round(halfZ * 2 / SVG_CELL));
+  halfX = (gw * SVG_CELL) / 2;
+  halfZ = (gh * SVG_CELL) / 2;
+  return { halfX, halfZ, gw, gh };
+}
+
+function rasterizeToWalls(image: HTMLImageElement, gw: number, gh: number) {
   const supersample = 4;
   const canvas = document.createElement("canvas");
-  canvas.width = SVG_GRID_W * supersample;
-  canvas.height = SVG_GRID_H * supersample;
+  canvas.width = gw * supersample;
+  canvas.height = gh * supersample;
   const ctx = canvas.getContext("2d", { willReadFrequently: true })!;
   ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
   const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
 
   const subPerCell = supersample * supersample;
-  const totalSubpixels = SVG_GRID_W * SVG_GRID_H * subPerCell;
+  const totalSubpixels = gw * gh * subPerCell;
   let opaqueTotal = 0;
-  const wallSubpixels = new Uint8Array(SVG_GRID_W * SVG_GRID_H);
-  for (let j = 0; j < SVG_GRID_H; j++) {
-    for (let i = 0; i < SVG_GRID_W; i++) {
+  const wallSubpixels = new Uint8Array(gw * gh);
+  for (let j = 0; j < gh; j++) {
+    for (let i = 0; i < gw; i++) {
       let wallHits = 0;
       for (let sj = 0; sj < supersample; sj++) {
         for (let si = 0; si < supersample; si++) {
@@ -406,16 +437,16 @@ function rasterizeToWalls(image: HTMLImageElement) {
           wallHits++;
         }
       }
-      wallSubpixels[j * SVG_GRID_W + i] = wallHits;
+      wallSubpixels[j * gw + i] = wallHits;
     }
   }
 
-  // Gambar transparan (hanya bentuk) -> yang digambar = dinding (mode alpha).
-  // Gambar padat (mis. denah latar putih) -> area GELAP = dinding, area terang = terbuka.
+  // PNG dengan transparansi -> area OPAQUE = dinding, area TRANSPARAN = jalur orc.
+  // PNG/JPG padat (tanpa alpha) -> otomatis: area GELAP = dinding, area TERANG = jalur.
   const inverted = opaqueTotal / totalSubpixels > 0.62;
   if (inverted) {
-    for (let j = 0; j < SVG_GRID_H; j++) {
-      for (let i = 0; i < SVG_GRID_W; i++) {
+    for (let j = 0; j < gh; j++) {
+      for (let i = 0; i < gw; i++) {
         let wallHits = 0;
         for (let sj = 0; sj < supersample; sj++) {
           for (let si = 0; si < supersample; si++) {
@@ -425,28 +456,40 @@ function rasterizeToWalls(image: HTMLImageElement) {
             if (luminance < 105) wallHits++;
           }
         }
-        wallSubpixels[j * SVG_GRID_W + i] = wallHits;
+        wallSubpixels[j * gw + i] = wallHits;
       }
     }
   }
   const threshold = Math.max(3, Math.floor(subPerCell * 0.25));
-  const walls = new Uint8Array(SVG_GRID_W * SVG_GRID_H);
+  const walls = new Uint8Array(gw * gh);
   for (let k = 0; k < walls.length; k++) walls[k] = wallSubpixels[k] >= threshold ? 1 : 0;
   return { walls, inverted };
 }
 
 export interface SvgMapResult {
   lanes: RaidLane[];
-  walls: Uint8Array;
+  grid: CollisionGrid; // collision final (sudah di-carve agar orc tidak macet)
   inverted: boolean;
   image: HTMLImageElement;
+  width: number;
+  height: number;
 }
 
 export async function loadSvgMap(dataUrl: string): Promise<SvgMapResult | null> {
   const source = await normalizeImageSource(dataUrl);
   const image = await loadImageElement(source);
-  const raster = rasterizeToWalls(image);
-  const built = buildLanesFromWalls(raster.walls);
+  const size = arenaSizeForImage(image.naturalWidth || image.width, image.naturalHeight || image.height);
+  const raw = rasterizeToWalls(image, size.gw, size.gh);
+  const grid: CollisionGrid = {
+    walls: raw.walls,
+    gw: size.gw,
+    gh: size.gh,
+    halfX: size.halfX,
+    halfZ: size.halfZ,
+    startX: -(size.halfX + 12),
+    endX: size.halfX + 10,
+  };
+  const built = buildLanesFromWalls(grid);
   if (built.rejected) return null;
-  return { lanes: built.lanes, walls: built.carved, inverted: raster.inverted, image };
+  return { lanes: built.lanes, grid: built.carved, inverted: raw.inverted, image, width: image.naturalWidth, height: image.naturalHeight };
 }

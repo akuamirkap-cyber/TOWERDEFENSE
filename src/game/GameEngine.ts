@@ -7,7 +7,7 @@ import { MarineVisualSystem, type MarinePose } from "./MarineVisualSystem";
 import { OrcRunnerSystem, runCycle } from "./OrcRunnerSystem";
 import { RagdollSystem } from "./RagdollSystem";
 import { createRaidLanes, createDecorRoads, ENTRY_ORDER, isValidRaidLanes, MAP_HALF_X, MAP_HALF_Z, FORTRESS_X, trackName, VISUAL_HALF_X, VISUAL_HALF_Z, type RaidLane } from "./TrackGenerator";
-import { loadSvgMap, svgBlocked, svgCollideWalls } from "./SvgMapSystem";
+import { loadSvgMap, gridBlocked, gridCollide, type CollisionGrid } from "./SvgMapSystem";
 import { WeatherSystem } from "./WeatherSystem";
 import {
   ABILITIES,
@@ -277,10 +277,6 @@ const DIRECTOR_STORAGE_KEY = "orc-problem-director-v1";
 const TRACK_STORAGE_KEY = "orc-problem-track-v2";
 const SVG_STORAGE_KEY = "orc-problem-svgmap-v1";
 const SVG_MAX_DATAURL = 2_600_000;
-// Resolusi tekstur visual dinding (6 px per unit dunia, grid 80x60 sel).
-const SVG_GRID_VISUAL_W = 80;
-const SVG_VISUAL_W = 960;
-const SVG_VISUAL_H = 720;
 const MAX_ORCS = 14000;
 const MAX_CORPSES = 800;
 const MAX_BLOOD = 1500;
@@ -447,10 +443,13 @@ export class GameEngine {
   private decorRoads: PathSample[][] = [];
   private svgDataUrl: string | null = null;
   private svgLanes: RaidLane[] | null = null;
-  private svgWalls: Uint8Array | null = null;
-  private svgWallMesh: THREE.Mesh | null = null;
+  private svgGrid: CollisionGrid | null = null;
   private svgImage: HTMLImageElement | null = null;
   private terrainCtx: CanvasRenderingContext2D | null = null;
+  // Ukuran arena aktif: mengikuti aspek PNG saat peta gambar dipasang.
+  private arenaHalfX = MAP_HALF_X;
+  private arenaHalfZ = MAP_HALF_Z;
+  private fortressX = FORTRESS_X;
   private terrainObstacles: TerrainObstacle[] = [];
   private roadVisuals: THREE.Mesh[] = [];
   private decorationVisuals: THREE.InstancedMesh[] = [];
@@ -755,8 +754,8 @@ export class GameEngine {
     const halfWidth = (this.camera.right - this.camera.left) / (2 * this.camera.zoom);
     const halfHeight = (this.camera.top - this.camera.bottom) / (2 * this.camera.zoom);
     const groundProjection = this.cameraOffset.y / this.cameraOffset.length();
-    this.cameraTarget.x = clamp(this.cameraTarget.x, -Math.max(0, MAP_HALF_X - halfWidth + 6), Math.max(0, MAP_HALF_X - halfWidth + 6));
-    this.cameraTarget.z = clamp(this.cameraTarget.z, -Math.max(0, MAP_HALF_Z - halfHeight / groundProjection + 6), Math.max(0, MAP_HALF_Z - halfHeight / groundProjection + 6));
+    this.cameraTarget.x = clamp(this.cameraTarget.x, -Math.max(0, this.arenaHalfX - halfWidth + 6), Math.max(0, this.arenaHalfX - halfWidth + 6));
+    this.cameraTarget.z = clamp(this.cameraTarget.z, -Math.max(0, this.arenaHalfZ - halfHeight / groundProjection + 6), Math.max(0, this.arenaHalfZ - halfHeight / groundProjection + 6));
   }
 
   private createPath() {
@@ -917,10 +916,10 @@ export class GameEngine {
     // Arena 160x120 unit di tengah bidang visual 240x190 -> 768px.
     const pxPerUnitX = 768 / (VISUAL_HALF_X * 2);
     const pxPerUnitZ = 768 / (VISUAL_HALF_Z * 2);
-    const drawX = (VISUAL_HALF_X - MAP_HALF_X) * pxPerUnitX;
-    const drawZ = (VISUAL_HALF_Z - MAP_HALF_Z) * pxPerUnitZ;
-    const drawW = MAP_HALF_X * 2 * pxPerUnitX;
-    const drawH = MAP_HALF_Z * 2 * pxPerUnitZ;
+    const drawX = (VISUAL_HALF_X - this.arenaHalfX) * pxPerUnitX;
+    const drawZ = (VISUAL_HALF_Z - this.arenaHalfZ) * pxPerUnitZ;
+    const drawW = this.arenaHalfX * 2 * pxPerUnitX;
+    const drawH = this.arenaHalfZ * 2 * pxPerUnitZ;
     ctx.save();
     ctx.imageSmoothingEnabled = true;
     ctx.imageSmoothingQuality = "high";
@@ -972,7 +971,7 @@ export class GameEngine {
 
   private createDecorations() {
     // Peta PNG: terrain sudah berupa gambar, dekorasi 3D dinonaktifkan.
-    if (this.svgWalls) return;
+    if (this.svgGrid) return;
     const random = randomGenerator(4623 ^ this.trackSeed);
     const dummy = new THREE.Object3D();
     const configs = [
@@ -1020,11 +1019,11 @@ export class GameEngine {
       let attempts = 0;
       while (placed < config.count && attempts < config.count * 30) {
         attempts++;
-        const x = (random() - 0.5) * (MAP_HALF_X * 2 - 6);
-        const z = (random() - 0.5) * (MAP_HALF_Z * 2 - 6);
+        const x = (random() - 0.5) * (this.arenaHalfX * 2 - 6);
+        const z = (random() - 0.5) * (this.arenaHalfZ * 2 - 6);
         if (this.distanceToPathSquared(x, z) < config.padding * config.padding) continue;
-        if (this.svgWalls && svgBlocked(this.svgWalls, x, z, 1.8)) continue;
-        if ((x - FORTRESS_X) ** 2 + z * z < 10.5 ** 2) continue;
+        if (this.svgGrid && gridBlocked(this.svgGrid, x, z, 1.8)) continue;
+        if ((x - this.fortressX) ** 2 + z * z < 10.5 ** 2) continue;
         if (this.towers.some((tower) => (tower.x - x) ** 2 + (tower.z - z) ** 2 < 3.1 ** 2)) continue;
         const scale = config.minScale + random() * (config.maxScale - config.minScale);
         dummy.position.set(x, config.count === 145 ? 0.12 * scale : config.count === 190 ? 0.38 * scale : config.count === 46 ? 1.25 * scale : 0.32 * scale, z);
@@ -1114,7 +1113,7 @@ export class GameEngine {
     this.fortressFlag = flag;
     group.add(flag);
     // Benteng berdiri di tepi timur (kanan layar) — tujuan akhir horde orc.
-    group.position.set(FORTRESS_X, 0, 0);
+    group.position.set(this.fortressX, 0, 0);
     this.scene.add(group);
 
     const stakeMaterial = new THREE.MeshLambertMaterial({ color: 0x704b31, flatShading: true });
@@ -1725,8 +1724,8 @@ export class GameEngine {
 
       // Knockback trajectory, tumbling in the air, and smoking from Hulk smash
       if (unit.vx || unit.vz || (unit.liftV !== undefined && unit.liftV !== 0) || (unit.lift !== undefined && unit.lift > 0)) {
-        unit.x = clamp(unit.x + (unit.vx || 0) * dt, -MAP_HALF_X + 4, MAP_HALF_X - 4);
-        unit.z = clamp(unit.z + (unit.vz || 0) * dt, -MAP_HALF_Z + 4, MAP_HALF_Z - 4);
+        unit.x = clamp(unit.x + (unit.vx || 0) * dt, -this.arenaHalfX + 4, this.arenaHalfX - 4);
+        unit.z = clamp(unit.z + (unit.vz || 0) * dt, -this.arenaHalfZ + 4, this.arenaHalfZ - 4);
         unit.vx = (unit.vx || 0) * Math.exp(-dt * 2.8);
         unit.vz = (unit.vz || 0) * Math.exp(-dt * 2.8);
 
@@ -1861,8 +1860,8 @@ export class GameEngine {
           unit.x = oldX;
           unit.z = oldZ;
         }
-        unit.x = clamp(unit.x, -MAP_HALF_X + 5, MAP_HALF_X - 5);
-        unit.z = clamp(unit.z, -MAP_HALF_Z + 5, MAP_HALF_Z - 5);
+        unit.x = clamp(unit.x, -this.arenaHalfX + 5, this.arenaHalfX - 5);
+        unit.z = clamp(unit.z, -this.arenaHalfZ + 5, this.arenaHalfZ - 5);
         const moved = Math.hypot(unit.x - oldX, unit.z - oldZ);
         const oldPhase = unit.walkPhase;
         // Heavy Hulkbuster walking stride
@@ -2404,18 +2403,18 @@ export class GameEngine {
       if (Math.abs(obstacle.x - body.x) > 2 || Math.abs(obstacle.z - body.z) > 2) continue;
       collided = this.resolveCircle(body, obstacle.x, obstacle.z, obstacle.radius) || collided;
     }
-    if (this.svgWalls) {
-      svgCollideWalls(this.svgWalls, body, (x, z, radius) => this.resolveCircle(body, x, z, radius));
+    if (this.svgGrid) {
+      gridCollide(this.svgGrid, body, (x, z, radius) => this.resolveCircle(body, x, z, radius));
     }
-    if (Math.abs(body.x - FORTRESS_X) < 8.5 && Math.abs(body.z) < 8.5) {
-      collided = this.resolveCircle(body, FORTRESS_X, 0, 3.25) || collided;
+    if (Math.abs(body.x - this.fortressX) < 8.5 && Math.abs(body.z) < 8.5) {
+      collided = this.resolveCircle(body, this.fortressX, 0, 3.25) || collided;
       for (const x of [-5.2, 5.2]) {
-        for (const z of [-5.2, 5.2]) collided = this.resolveCircle(body, FORTRESS_X + x, z, 1.17) || collided;
+        for (const z of [-5.2, 5.2]) collided = this.resolveCircle(body, this.fortressX + x, z, 1.17) || collided;
       }
     }
     if (collided) this.constrainToLane(body);
-    body.x = clamp(body.x, -MAP_HALF_X - 14, MAP_HALF_X + 8);
-    body.z = clamp(body.z, -MAP_HALF_Z + 3, MAP_HALF_Z - 3);
+    body.x = clamp(body.x, -this.arenaHalfX - 14, this.arenaHalfX + 8);
+    body.z = clamp(body.z, -this.arenaHalfZ + 3, this.arenaHalfZ - 3);
   }
 
   private spawnOrc() {
@@ -2650,7 +2649,7 @@ export class GameEngine {
           this.damageTower(raidTower, enemy.armored ? 6 : 4, enemy);
         }
       }
-      const breachX = enemy.isSuperHulk ? MAP_HALF_X - 9 : MAP_HALF_X - 6;
+      const breachX = enemy.isSuperHulk ? this.arenaHalfX - 9 : this.arenaHalfX - 6;
       if (enemy.distance >= this.pathLengths[enemy.lane] - 14 && enemy.x >= breachX) {
         enemy.alive = false;
         this.escaped++;
@@ -2761,7 +2760,7 @@ export class GameEngine {
         }
         corpse.vy = Math.abs(corpse.vy) > 2 ? Math.abs(corpse.vy) * 0.28 : 0;
       }
-      if (corpse.age > 1.8 || Math.abs(corpse.x) > MAP_HALF_X || Math.abs(corpse.z) > MAP_HALF_Z) {
+      if (corpse.age > 1.8 || Math.abs(corpse.x) > this.arenaHalfX || Math.abs(corpse.z) > this.arenaHalfZ) {
         this.corpses.splice(index, 1);
       }
     }
@@ -4214,10 +4213,11 @@ export class GameEngine {
   }
 
   private isValidPlacement(x: number, z: number, ignoredTowerId?: number) {
-    if (Math.abs(x) > MAP_HALF_X - 8 || Math.abs(z) > MAP_HALF_Z - 7) return false;
-    if ((x - FORTRESS_X) ** 2 + z * z < 8.7 ** 2) return false;
+    if (Math.abs(x) > this.arenaHalfX - 8 || Math.abs(z) > this.arenaHalfZ - 7) return false;
+    if ((x - this.fortressX) ** 2 + z * z < 8.7 ** 2) return false;
     if (this.distanceToPathSquared(x, z) < 6.4 ** 2) return false;
-    if (this.svgWalls && svgBlocked(this.svgWalls, x, z, 2.1)) return false;
+    // Turret hanya boleh di area collision terbuka (transparan pada PNG).
+    if (this.svgGrid && gridBlocked(this.svgGrid, x, z, 2.1)) return false;
     if (this.terrainObstacles.some((obstacle) => (obstacle.x - x) ** 2 + (obstacle.z - z) ** 2 < (obstacle.radius + 1.45) ** 2)) return false;
     return !this.towers.some((tower) => tower.id !== ignoredTowerId && (tower.x - x) ** 2 + (tower.z - z) ** 2 < 3.2 ** 2);
   }
@@ -4249,6 +4249,7 @@ export class GameEngine {
     else this.paintBaseTerrain();
     this.createPath();
     this.createRoad();
+
     this.clearDecorations();
     this.relocateTowers();
     this.initLaneGuardMarines();
@@ -4258,9 +4259,9 @@ export class GameEngine {
     this.splatIndex = 0;
     this.splatCount = 0;
     this.splatMesh.count = 0;
-    this.buildWallVisual();
     this.updateRangeRings();
     this.updateGhost();
+    this.clampCameraTarget();
   }
 
   public generateTrack() {
@@ -4276,8 +4277,11 @@ export class GameEngine {
     this.trackLanes = lanes;
     this.svgDataUrl = null;
     this.svgLanes = null;
-    this.svgWalls = null;
+    this.svgGrid = null;
     this.svgImage = null;
+    this.arenaHalfX = MAP_HALF_X;
+    this.arenaHalfZ = MAP_HALF_Z;
+    this.fortressX = FORTRESS_X;
     try {
       localStorage.removeItem(SVG_STORAGE_KEY);
     } catch {
@@ -4317,9 +4321,13 @@ export class GameEngine {
     }
     this.svgDataUrl = dataUrl;
     this.svgLanes = result.lanes;
-    this.svgWalls = result.walls;
+    this.svgGrid = result.grid;
     this.svgImage = result.image;
     this.trackLanes = result.lanes;
+    // Arena mengikuti panjang & lebar PNG.
+    this.arenaHalfX = result.grid.halfX;
+    this.arenaHalfZ = result.grid.halfZ;
+    this.fortressX = result.grid.endX - 6;
     try {
       localStorage.setItem(SVG_STORAGE_KEY, JSON.stringify({ data: dataUrl }));
     } catch {
@@ -4327,7 +4335,7 @@ export class GameEngine {
     }
     this.rebuildTrack();
     this.playSound("place");
-    this.onToast(`🗺️ Terrain & collision kini mengikuti PNG: dinding gelap solid, 4 jalur orc otomatis menembus area terang${result.inverted ? "" : " (mode bentuk)"}.`);
+    this.onToast(`🗺️ PNG ${result.width}×${result.height}px dipasang: arena ${Math.round(result.grid.halfX * 2)}×${Math.round(result.grid.halfZ * 2)}m, area opaque = tembok, transparan = jalur orc.`);
     this.emit();
   }
 
@@ -4339,8 +4347,11 @@ export class GameEngine {
     if (!this.svgDataUrl) return;
     this.svgDataUrl = null;
     this.svgLanes = null;
-    this.svgWalls = null;
+    this.svgGrid = null;
     this.svgImage = null;
+    this.arenaHalfX = MAP_HALF_X;
+    this.arenaHalfZ = MAP_HALF_Z;
+    this.fortressX = FORTRESS_X;
     try {
       localStorage.removeItem(SVG_STORAGE_KEY);
     } catch {
@@ -4350,55 +4361,6 @@ export class GameEngine {
     this.playSound("place");
     this.onToast("♻️ Peta PNG dihapus, kembali ke peta prosedural.");
     this.emit();
-  }
-
-  // Gambar dinding dari peta SVG sebagai bidang gelap di atas tanah.
-  private buildWallVisual() {
-    if (this.svgWallMesh) {
-      this.scene.remove(this.svgWallMesh);
-      this.svgWallMesh.geometry.dispose();
-      const material = this.svgWallMesh.material as THREE.MeshLambertMaterial;
-      if (material.map) material.map.dispose();
-      material.dispose();
-      this.svgWallMesh = null;
-    }
-    const walls = this.svgWalls;
-    if (!walls) return;
-    const canvas = document.createElement("canvas");
-    canvas.width = SVG_VISUAL_W;
-    canvas.height = SVG_VISUAL_H;
-    const ctx = canvas.getContext("2d")!;
-    const cellPx = SVG_VISUAL_W / SVG_GRID_VISUAL_W;
-    let seedValue = 991;
-    const jitter = () => {
-      seedValue = (Math.imul(seedValue, 1664525) + 1013904223) >>> 0;
-      return seedValue / 4294967296;
-    };
-    // Lapisan tepi gelap lalu isi inti agar massa dinding terlihat membulat organik.
-    for (const [color, radiusScale] of [["#2c323a", 1.26], ["#3d444d", 0.98]] as const) {
-      for (let cell = 0; cell < walls.length; cell++) {
-        if (walls[cell] !== 1) continue;
-        const i = cell % SVG_GRID_VISUAL_W;
-        const j = (cell - i) / SVG_GRID_VISUAL_W;
-        const px = (i + 0.5) * cellPx + (jitter() - 0.5) * cellPx * 0.3;
-        const pz = (j + 0.5) * cellPx + (jitter() - 0.5) * cellPx * 0.3;
-        ctx.fillStyle = color;
-        ctx.beginPath();
-        ctx.arc(px, pz, cellPx * 0.62 * radiusScale, 0, Math.PI * 2);
-        ctx.fill();
-      }
-    }
-    const texture = new THREE.CanvasTexture(canvas);
-    texture.colorSpace = THREE.SRGBColorSpace;
-    const mesh = new THREE.Mesh(
-      new THREE.PlaneGeometry(MAP_HALF_X * 2, MAP_HALF_Z * 2),
-      new THREE.MeshLambertMaterial({ map: texture, transparent: true, depthWrite: false }),
-    );
-    mesh.rotation.x = -Math.PI / 2;
-    mesh.position.set(0, 0.075, 0);
-    mesh.renderOrder = 6;
-    this.svgWallMesh = mesh;
-    this.scene.add(mesh);
   }
 
   private updateGhost() {
