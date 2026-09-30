@@ -435,7 +435,7 @@ export default function App() {
                       type="button"
                       className="track-generate svg-upload-btn"
                       onClick={() => svgInputRef.current?.click()}
-                      title="Unggah PNG peta: terrain mengikuti gambar, area gelap jadi DINDING yang tidak bisa dilewati orc, jalur orc otomatis mencari jalan"
+                      title="Unggah PNG peta: terrain mengikuti gambar, area gelap/opaque jadi DINDING, transparan = jalur orc. Peta APA PUN diterima — kalau tidak ada lorong kiri→kanan, jalur orc membuka jalan otomatis"
                     >
                       <span><ScanLine size={13} /> {game.svgMap ? "GANTI PNG PETA" : "PETA DARI PNG"}</span>
                       <small>{game.svgMap ? "aktif" : "png"}<ScanLine size={11} /></small>
@@ -455,7 +455,7 @@ export default function App() {
                         type="button"
                         className="track-generate svg-rotate-btn"
                         onClick={() => engineRef.current?.rotateSvgMap()}
-                        title="Putar peta PNG 90° searah jarum jam: jalur orc, collision & terrain ikut dihitung ulang"
+                        title="Putar peta PNG 90° searah jarum jam — selalu bisa: jalur orc, collision & terrain dihitung ulang (kalau perlu, jalan dibuka paksa)"
                       >
                         <span><RotateCw size={13} /> PUTAR 90°</span>
                       </button>

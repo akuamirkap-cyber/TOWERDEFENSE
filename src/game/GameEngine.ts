@@ -4336,7 +4336,7 @@ export class GameEngine {
     }
     if (!result || !result.ok) {
       const reason = result && !result.ok ? ` ${result.reason}` : "";
-      this.onToast(`❌ Peta ditolak:${reason}`);
+      this.onToast(`❌ Peta gagal dimuat: ${reason}`);
       return;
     }
     if (!("grid" in result)) return;
@@ -4357,8 +4357,11 @@ export class GameEngine {
     }
     this.rebuildTrack();
     this.playSound("place");
-    const rotNote = result.rotation !== 0 ? `, diputar ${result.rotation}° agar jalur kiri→kanan tersambung` : "";
-    this.onToast(`🗺️ PNG ${result.width}×${result.height}px dipasang: arena ${Math.round(result.grid.halfX * 2)}×${Math.round(result.grid.halfZ * 2)}m, area opaque = tembok, transparan = jalur orc${rotNote}.`);
+    const rotNote = result.rotation !== 0 ? `, diputar ${result.rotation}°` : "";
+    const carveNote = result.carvedCells > 0
+      ? ` ⚠️ Tidak ada lorong transparan kiri→kanan di arah ini: ${result.carvedCells} sel tembok dibuka paksa untuk jalur orc — tekan PUTAR 90° kalau mau arah lain.`
+      : "";
+    this.onToast(`🗺️ PNG ${result.width}×${result.height}px dipasang: arena ${Math.round(result.grid.halfX * 2)}×${Math.round(result.grid.halfZ * 2)}m, area opaque = tembok, transparan = jalur orc${rotNote}.${carveNote}`);
     this.emit();
   }
 
@@ -4390,11 +4393,9 @@ export class GameEngine {
       startX: -(grid.halfZ + 12),
       endX: grid.halfZ + 10,
     };
+    // Selalu berhasil: kalau tidak ada lorong transparan kiri→kanan di arah
+    // ini, jalur orc dicari "lunak" dan sel tembok yang dilewati dibuka paksa.
     const built = buildLanesFromWalls(rotated);
-    if (built.rejected) {
-      this.onToast("❌ Arah ini tidak punya jalur orc kiri→kanan. Coba putar lagi.");
-      return;
-    }
     this.svgGrid = built.carved;
     this.svgLanes = built.lanes;
     this.trackLanes = built.lanes;
@@ -4409,7 +4410,10 @@ export class GameEngine {
     } catch {
       // Tanpa storage, rotasi tetap berlaku di sesi ini.
     }
-    this.onToast(`🔄 Peta diputar 90° (total ${this.svgRotation}°). Jalur orc & collision dihitung ulang.`);
+    const carveNote = built.carvedCells > 0
+      ? ` ⚠️ Tidak ada lorong transparan kiri→kanan di arah ini — ${built.carvedCells} sel tembok dibuka paksa.`
+      : "";
+    this.onToast(`🔄 Peta diputar 90° (total ${this.svgRotation}°). Jalur orc & collision dihitung ulang.${carveNote}`);
     this.emit();
   }
 

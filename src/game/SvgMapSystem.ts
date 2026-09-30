@@ -258,6 +258,15 @@ function edgeReachable(grid: CollisionGrid, blocked: Uint8Array, side: -1 | 1) {
 
 // A* barat->timur. Mulai dari kolom 0..7 mana pun yang terbuka (tepi inset
 // tetap kehitung), selesai di kolom gw-8..gw-1.
+// Penalti per sel tembok saat mode lunak: cukup besar agar A* memutar jauh
+// menghindari tembok, tapi tetap bisa menembus kalau tidak ada jalan sama sekali.
+const WALL_PENALTY = 16;
+
+interface FoundPath {
+  path: PathCell[];
+  crossings: number; // berapa sel tembok asli yang dilewati (0 = rute murni transparan)
+}
+
 function findPath(
   grid: CollisionGrid,
   blocked: Uint8Array,
@@ -265,7 +274,8 @@ function findPath(
   band: Band,
   startReach: Uint8Array,
   goalReach: Uint8Array,
-): PathCell[] | null {
+  soft = false,
+): FoundPath | null {
   const gScore = new Float32Array(grid.gw * grid.gh).fill(Infinity);
   const cameFrom = new Int32Array(grid.gw * grid.gh).fill(-1);
   const closed = new Uint8Array(grid.gw * grid.gh);
@@ -278,9 +288,10 @@ function findPath(
   for (let j = 0; j < grid.gh; j++) {
     for (let i = 0; i <= startMax; i++) {
       const idx = i + j * grid.gw;
-      if (blocked[idx] === 1) continue; // orc hanya mulai dari area transparan
-      if (startReach[idx] !== 1) continue; // harus tersambung ke tepi barat
-      const cost = i * 0.12 + Math.abs(gridCellZ(grid, j) - band.center) * 0.6;
+      if (!soft && blocked[idx] === 1) continue; // orc hanya mulai dari area transparan
+      if (!soft && startReach[idx] !== 1) continue; // harus tersambung ke tepi barat
+      const cost = i * 0.12 + Math.abs(gridCellZ(grid, j) - band.center) * 0.6 +
+        (soft && grid.walls[idx] === 1 ? WALL_PENALTY : 0);
       if (cost < gScore[idx]) {
         gScore[idx] = cost;
         heap.push(idx, cost + heuristic(i, j));
@@ -295,7 +306,7 @@ function findPath(
     closed[current] = 1;
     const ci = current % grid.gw;
     const cj = (current - ci) / grid.gw;
-    if (ci >= goalMin && goalReach[current] === 1) {
+    if (ci >= goalMin && (soft || goalReach[current] === 1)) {
       const path: PathCell[] = [];
       let cursor: number = current;
       while (cursor >= 0) {
@@ -304,26 +315,47 @@ function findPath(
         cursor = cameFrom[cursor];
       }
       path.reverse();
-      // Sambungkan lewat pintu: tepi->start dan goal->tepi.
-      const prefix = pathToEdge(grid, blocked, path[0], -1);
-      // pathToEdge mengembalikan urutan tepi->target; balik untuk suffix agar
-      // polyline meneruskan goal->pintu->tepi (bukan muter balik).
-      const suffix = pathToEdge(grid, blocked, path[path.length - 1], 1).reverse();
-      while (prefix.length > 0 && path.length > 0 &&
-        prefix[prefix.length - 1].i === path[0].i && prefix[prefix.length - 1].j === path[0].j) prefix.pop();
-      while (suffix.length > 0 && path.length > 0 &&
-        suffix[0].i === path[path.length - 1].i && suffix[0].j === path[path.length - 1].j) suffix.shift();
-      return [...prefix, ...path, ...suffix];
+      let full: PathCell[];
+      if (soft) {
+        // Mode lunak: tepi mungkin tertutup rapat — sambung lurus ke tepi
+        // barat/timur; sel yang dilewati akan dibuka paksa sebagai jalan.
+        const first = path[0];
+        const last = path[path.length - 1];
+        const prefix: PathCell[] = [];
+        for (let i = first.i - 1; i >= 0; i--) prefix.push({ i, j: first.j });
+        prefix.reverse();
+        const suffix: PathCell[] = [];
+        for (let i = last.i + 1; i < grid.gw; i++) suffix.push({ i, j: last.j });
+        full = [...prefix, ...path, ...suffix];
+      } else {
+        // Sambungkan lewat pintu: tepi->start dan goal->tepi.
+        const prefix = pathToEdge(grid, blocked, path[0], -1);
+        // pathToEdge mengembalikan urutan tepi->target; balik untuk suffix agar
+        // polyline meneruskan goal->pintu->tepi (bukan muter balik).
+        const suffix = pathToEdge(grid, blocked, path[path.length - 1], 1).reverse();
+        while (prefix.length > 0 && path.length > 0 &&
+          prefix[prefix.length - 1].i === path[0].i && prefix[prefix.length - 1].j === path[0].j) prefix.pop();
+        while (suffix.length > 0 && path.length > 0 &&
+          suffix[0].i === path[path.length - 1].i && suffix[0].j === path[path.length - 1].j) suffix.shift();
+        full = [...prefix, ...path, ...suffix];
+      }
+      let crossings = 0;
+      for (const cell of full) {
+        if (grid.walls[cell.j * grid.gw + cell.i] === 1) crossings++;
+      }
+      return { path: full, crossings };
     }
     for (const [dx, dz, baseCost] of DIRS) {
       const ni = ci + dx;
       const nj = cj + dz;
       if (ni < 0 || ni >= grid.gw || nj < 0 || nj >= grid.gh) continue;
       const next = nj * grid.gw + ni;
-      if (closed[next] || blocked[next] === 1) continue;
+      if (closed[next]) continue;
+      const wall = blocked[next] === 1;
+      if (wall && !soft) continue;
       if (dx !== 0 && dz !== 0 && (blocked[cj * grid.gw + ni] === 1 || blocked[nj * grid.gw + ci] === 1)) continue;
       const centerPull = Math.abs(gridCellZ(grid, nj) - band.center) * 0.045;
-      const cost = gScore[current] + baseCost + separation[next] + centerPull;
+      const cost = gScore[current] + baseCost + separation[next] + centerPull + (wall ? WALL_PENALTY : 0);
       if (cost < gScore[next] - 1e-4) {
         gScore[next] = cost;
         cameFrom[next] = current;
@@ -420,6 +452,7 @@ export interface LanesFromGridResult {
   carved: CollisionGrid;
   rejected: boolean;
   pathFound: number;
+  carvedCells: number; // sel tembok asli yang dibuka paksa untuk jalur orc
 }
 
 // Logika murni (tanpa DOM) — bisa diuji di Node.
@@ -435,6 +468,7 @@ export function buildLanesFromWalls(grid: CollisionGrid): LanesFromGridResult {
   }));
   const foundControls: (TrackControl[] | null)[] = [];
   const bandCenters = bands.map((band) => band.center);
+  const forcedCells = new Set<number>();
   let pathFound = 0;
   for (let index = 0; index < bands.length; index++) {
     const band = bands[index];
@@ -444,13 +478,22 @@ export function buildLanesFromWalls(grid: CollisionGrid): LanesFromGridResult {
     const startLoose = edgeReachable(grid, grid.walls, -1);
     const goalReach = edgeReachable(grid, inflated, 1);
     const goalLoose = edgeReachable(grid, grid.walls, 1);
-    const path =
+    const found =
       findPath(grid, inflated, separation, band, startReach, goalReach) ??
-      findPath(grid, grid.walls, separation, band, startLoose, goalLoose);
-    if (path) {
+      findPath(grid, grid.walls, separation, band, startLoose, goalLoose) ??
+      // Mode lunak: tidak ada lorong transparan sama sekali — jalur orc
+      // menembus tembok dengan penalti, lalu sel yang dilewati dibuka paksa.
+      findPath(grid, grid.walls, separation, band, startLoose, goalLoose, true);
+    if (found) {
       pathFound++;
-      foundControls[index] = laneControlsFromPath(path, grid);
-      addSeparation(separation, grid, path);
+      if (found.crossings > 0) {
+        for (const cell of found.path) {
+          const idx = cell.j * grid.gw + cell.i;
+          if (grid.walls[idx] === 1) forcedCells.add(idx);
+        }
+      }
+      foundControls[index] = laneControlsFromPath(found.path, grid);
+      addSeparation(separation, grid, found.path);
     }
   }
   // Band tanpa rute memakai jalur band yang berhasil (terdekat di sumbu z)
@@ -474,10 +517,11 @@ export function buildLanesFromWalls(grid: CollisionGrid): LanesFromGridResult {
     label: band.label,
     controls: foundControls[index]!,
   }));
-  // Tidak ada satu pun rute barat->timur di area transparan -> peta ditolak.
-  const rejected = pathFound === 0;
-  const carvedGrid: CollisionGrid = rejected ? grid : { ...grid, walls: carveWalls(grid, lanes) };
-  return { lanes, carved: carvedGrid, rejected, pathFound };
+  // Sel tembok yang dilalui jalur paksa dibuka agar orc benar-benar bisa lewat.
+  const walls = carveWalls(grid, lanes);
+  for (const idx of forcedCells) walls[idx] = 0;
+  const carvedGrid: CollisionGrid = { ...grid, walls };
+  return { lanes, carved: carvedGrid, rejected: pathFound === 0, pathFound, carvedCells: forcedCells.size };
 }
 
 function loadImageElement(src: string) {
@@ -578,7 +622,8 @@ export interface SvgMapResult {
   image: HTMLImageElement;
   width: number;
   height: number;
-  rotation: number; // rotasi yang dipakai agar jalur barat->timur tersambung
+  rotation: number; // rotasi yang dipakai (selalu pilihan pemain)
+  carvedCells: number; // >0 = tidak ada lorong transparan, jalur orc dipaksa menembus tembok
 }
 
 export interface SvgMapFailure {
@@ -590,60 +635,43 @@ export interface SvgMapSuccess extends SvgMapResult {
   ok: true;
 }
 
-// Rotasi pilihan pemain dipakai lebih dulu; rotasi lain hanya kalau pilihan
-// pemain tidak punya rute orc kiri→kanan (mengembalikan `rotation` terpakai).
+// Peta APA PUN bisa dipasang pada orientasi pilihan pemain. Kalau tidak ada
+// lorong transparan kiri→kanan, jalur orc dicari "lunak" (boleh menembus
+// tembok dengan penalti) dan sel yang dilewati dibuka paksa — peta tidak
+// pernah ditolak lagi. carvedCells melaporkan berapa sel yang dibuka paksa;
+// pemain bisa menekan PUTAR 90° untuk orientasi lain yang lebih pas.
 export async function loadSvgMap(dataUrl: string, preferredRotation = 0): Promise<SvgMapSuccess | SvgMapFailure> {
   const preferred = [0, 90, 180, 270].includes(preferredRotation) ? preferredRotation : 0;
-  const order = [preferred, ...[0, 90, 180, 270].filter((r) => r !== preferred)];
-  const image = await loadImageElement(dataUrl);
+  let image: HTMLImageElement;
+  try {
+    image = await loadImageElement(dataUrl);
+  } catch {
+    return { ok: false, reason: "gambar tidak bisa dibaca — coba re-export PNG-mu lalu unggah lagi." };
+  }
   const imgW = image.naturalWidth || image.width;
   const imgH = image.naturalHeight || image.height;
-  let lastDiagnostics = "";
-  for (const rotation of order) {
-    const swap = rotation % 180 !== 0;
-    const size = arenaSizeForImage(swap ? imgH : imgW, swap ? imgW : imgH);
-    const raster = rasterizeToWalls(image, size.gw, size.gh, rotation);
-    const grid: CollisionGrid = {
-      walls: raster.walls,
-      gw: size.gw,
-      gh: size.gh,
-      halfX: size.halfX,
-      halfZ: size.halfZ,
-      startX: -(size.halfX + 12),
-      endX: size.halfX + 10,
-    };
-    const built = buildLanesFromWalls(grid);
-    if (!built.rejected) {
-      return {
-        ok: true,
-        lanes: built.lanes,
-        grid: built.carved,
-        inverted: raster.inverted,
-        image,
-        width: imgW,
-        height: imgH,
-        rotation,
-      };
-    }
-    // Diagnostik dari percobaan terbaik (rotasi 0 / orientasi asli).
-    if (rotation === 0) {
-      let westOpen = 0;
-      let eastOpen = 0;
-      for (let j = 0; j < grid.gh; j++) {
-        if (grid.walls[j * grid.gw] === 0) westOpen++;
-        if (grid.walls[j * grid.gw + grid.gw - 1] === 0) eastOpen++;
-      }
-      const pct = Math.round(raster.openFraction * 100);
-      if (raster.openFraction < 0.04) {
-        lastDiagnostics = `hanya ${pct}% area terbuka — hampir seluruh PNG tertutup/terang. Buka area transparan yang menyambung kiri ke kanan.`;
-      } else if (westOpen === 0 && eastOpen === 0) {
-        lastDiagnostics = `${pct}% area terbuka, tapi tidak ada lubang transparan di tepi KIRI maupun KANAN. Gambar pintu masuk di tepi kiri & keluar di tepi kanan.`;
-      } else if (westOpen === 0 || eastOpen === 0) {
-        lastDiagnostics = `${pct}% area terbuka, tapi ${westOpen === 0 ? "tepi KIRI tertutup" : "tepi KANAN tertutup"} — orc tidak punya jalan masuk/keluar.`;
-      } else {
-        lastDiagnostics = `${pct}% area terbuka & tepi kiri/kanan bolong, tapi tidak tersambung (dipisah dinding). Sambungkan area transparan dari kiri ke kanan, atau perlebar koridor sempit (min ~3 sel / 6 unit).`;
-      }
-    }
-  }
-  return { ok: false, reason: lastDiagnostics };
+  const swap = preferred % 180 !== 0;
+  const size = arenaSizeForImage(swap ? imgH : imgW, swap ? imgW : imgH);
+  const raster = rasterizeToWalls(image, size.gw, size.gh, preferred);
+  const grid: CollisionGrid = {
+    walls: raster.walls,
+    gw: size.gw,
+    gh: size.gh,
+    halfX: size.halfX,
+    halfZ: size.halfZ,
+    startX: -(size.halfX + 12),
+    endX: size.halfX + 10,
+  };
+  const built = buildLanesFromWalls(grid);
+  return {
+    ok: true,
+    lanes: built.lanes,
+    grid: built.carved,
+    inverted: raster.inverted,
+    image,
+    width: imgW,
+    height: imgH,
+    rotation: preferred,
+    carvedCells: built.carvedCells,
+  };
 }
