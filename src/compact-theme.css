@@ -109,6 +109,8 @@
 .svg-upload-btn:hover > span svg { transform: none; }
 .svg-clear-btn { border-top-color: #c25a4470; color: #a03d2b; }
 .svg-clear-btn:hover { color: #c22b12; }
+.svg-rotate-btn { border-top-color: #5a7ac270; color: #3d5a7a; }
+.svg-rotate-btn:hover { color: #2b4a7a; }
 .front-intel { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 5px; margin-top: 9px; padding: 6px 0 1px; border-top: 1px solid #b38b5966; }
 .front-intel span { display: flex; flex-direction: column; align-items: center; gap: 2px; min-width: 0; color: #806448; }
 .front-intel small { font-size: 7px; font-weight: 900; letter-spacing: 0.02em; }

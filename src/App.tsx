@@ -20,6 +20,7 @@ import {
   Play,
   RotateCcw,
   Rocket,
+  RotateCw,
   ScanLine,
   Shield,
   Shuffle,
@@ -90,6 +91,7 @@ const initialSnapshot: GameSnapshot = {
   trackName: "FOUR CORRIDORS",
   trackLength: 370,
   svgMap: false,
+  svgRotation: 0,
   weather: "sunny",
   cameraZoom: 1,
   orcSpeed: 1,
@@ -423,7 +425,7 @@ export default function App() {
                         const file = event.target.files?.[0];
                         if (file) {
                           const reader = new FileReader();
-                          reader.onload = () => engineRef.current?.applySvgMap(String(reader.result));
+                          reader.onload = () => engineRef.current?.applySvgMap(String(reader.result), game.svgRotation);
                           reader.readAsDataURL(file);
                         }
                         event.target.value = "";
@@ -446,6 +448,16 @@ export default function App() {
                         title="Hapus peta gambar, kembali ke peta prosedural"
                       >
                         <span><Trash2 size={13} /> HAPUS PETA</span>
+                      </button>
+                    )}
+                    {game.svgMap && (
+                      <button
+                        type="button"
+                        className="track-generate svg-rotate-btn"
+                        onClick={() => engineRef.current?.rotateSvgMap()}
+                        title="Putar peta PNG 90° searah jarum jam: jalur orc, collision & terrain ikut dihitung ulang"
+                      >
+                        <span><RotateCw size={13} /> PUTAR 90°</span>
                       </button>
                     )}
                     <button type="button" className="track-generate" onClick={() => engineRef.current?.generateTrack()} title="Buat empat jalur serangan baru dari barat ke timur (G)">

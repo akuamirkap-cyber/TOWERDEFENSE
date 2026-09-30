@@ -590,13 +590,16 @@ export interface SvgMapSuccess extends SvgMapResult {
   ok: true;
 }
 
-// Coba semua rotasi kuartal; kembalikan hasil pertama yang punya rute.
-export async function loadSvgMap(dataUrl: string): Promise<SvgMapSuccess | SvgMapFailure> {
+// Rotasi pilihan pemain dipakai lebih dulu; rotasi lain hanya kalau pilihan
+// pemain tidak punya rute orc kiri→kanan (mengembalikan `rotation` terpakai).
+export async function loadSvgMap(dataUrl: string, preferredRotation = 0): Promise<SvgMapSuccess | SvgMapFailure> {
+  const preferred = [0, 90, 180, 270].includes(preferredRotation) ? preferredRotation : 0;
+  const order = [preferred, ...[0, 90, 180, 270].filter((r) => r !== preferred)];
   const image = await loadImageElement(dataUrl);
   const imgW = image.naturalWidth || image.width;
   const imgH = image.naturalHeight || image.height;
   let lastDiagnostics = "";
-  for (const rotation of [0, 90, 180, 270]) {
+  for (const rotation of order) {
     const swap = rotation % 180 !== 0;
     const size = arenaSizeForImage(swap ? imgH : imgW, swap ? imgW : imgH);
     const raster = rasterizeToWalls(image, size.gw, size.gh, rotation);

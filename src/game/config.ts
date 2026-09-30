@@ -220,6 +220,7 @@ export interface GameSnapshot {
   trackName: string;
   trackLength: number;
   svgMap: boolean;
+  svgRotation: number;
   weather: WeatherMode;
   cameraZoom: number;
   orcSpeed: number;

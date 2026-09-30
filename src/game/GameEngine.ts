@@ -7,7 +7,7 @@ import { MarineVisualSystem, type MarinePose } from "./MarineVisualSystem";
 import { OrcRunnerSystem, runCycle } from "./OrcRunnerSystem";
 import { RagdollSystem } from "./RagdollSystem";
 import { createRaidLanes, createDecorRoads, ENTRY_ORDER, isValidRaidLanes, MAP_HALF_X, MAP_HALF_Z, FORTRESS_X, trackName, VISUAL_HALF_X, VISUAL_HALF_Z, type RaidLane } from "./TrackGenerator";
-import { loadSvgMap, gridBlocked, gridCollide, type CollisionGrid } from "./SvgMapSystem";
+import { loadSvgMap, buildLanesFromWalls, gridBlocked, gridCollide, type CollisionGrid } from "./SvgMapSystem";
 import { WeatherSystem } from "./WeatherSystem";
 import {
   ABILITIES,
@@ -622,9 +622,10 @@ export class GameEngine {
     try {
       const raw = localStorage.getItem(SVG_STORAGE_KEY);
       if (raw) {
-        const parsed = JSON.parse(raw) as { data?: unknown };
+        const parsed = JSON.parse(raw) as { data?: unknown; rotation?: unknown };
         if (typeof parsed.data === "string" && parsed.data.startsWith("data:image/") && parsed.data.length <= SVG_MAX_DATAURL) {
-          void this.applySvgMap(parsed.data);
+          const rotation = typeof parsed.rotation === "number" && [0, 90, 180, 270].includes(parsed.rotation) ? parsed.rotation : 0;
+          void this.applySvgMap(parsed.data, rotation);
         }
       }
     } catch {
@@ -678,6 +679,7 @@ export class GameEngine {
       trackSeed: this.trackSeed,
       trackName: this.svgDataUrl ? "PETA SVG" : trackName(this.trackSeed),
       svgMap: this.svgDataUrl !== null,
+      svgRotation: this.svgRotation,
       trackLength: this.pathLength,
       weather: this.weather.mode,
       cameraZoom: this.camera.zoom,
@@ -4220,12 +4222,20 @@ export class GameEngine {
     this.emit();
   }
 
-  private isValidPlacement(x: number, z: number, ignoredTowerId?: number) {
-    if (Math.abs(x) > this.arenaHalfX - 8 || Math.abs(z) > this.arenaHalfZ - 7) return false;
+  private isValidPlacement(x: number, z: number, ignoredTowerId?: number, emergency = false) {
+    // Peta PNG: koridor transparan sempit, jadi aturan diperlonggar agar
+    // turret/outpost tetap bisa ditempatkan di area collision. Mode darurat
+    // (lorong sangat sempit): clearance minimum tanpa overlap visual.
+    const svgMode = this.svgGrid !== null;
+    const marginX = svgMode ? (emergency ? 4 : 6) : 8;
+    const marginZ = svgMode ? (emergency ? 3 : 5) : 7;
+    const laneClearance = svgMode ? (emergency ? 3.2 : 4.0) : 6.4;
+    const wallClearance = svgMode ? (emergency ? 1.2 : 1.6) : 2.1;
+    if (Math.abs(x) > this.arenaHalfX - marginX || Math.abs(z) > this.arenaHalfZ - marginZ) return false;
     if ((x - this.fortressX) ** 2 + z * z < 8.7 ** 2) return false;
-    if (this.distanceToPathSquared(x, z) < 6.4 ** 2) return false;
+    if (this.distanceToPathSquared(x, z) < laneClearance ** 2) return false;
     // Turret hanya boleh di area collision terbuka (transparan pada PNG).
-    if (this.svgGrid && gridBlocked(this.svgGrid, x, z, 2.1)) return false;
+    if (this.svgGrid && gridBlocked(this.svgGrid, x, z, wallClearance)) return false;
     if (this.terrainObstacles.some((obstacle) => (obstacle.x - x) ** 2 + (obstacle.z - z) ** 2 < (obstacle.radius + 1.45) ** 2)) return false;
     return !this.towers.some((tower) => tower.id !== ignoredTowerId && (tower.x - x) ** 2 + (tower.z - z) ** 2 < 3.2 ** 2);
   }
@@ -4307,8 +4317,8 @@ export class GameEngine {
     this.emit();
   }
 
-  // Pasang peta dari gambar yang diunggah (SVG/PNG/JPG): area digambar jadi dinding.
-  public async applySvgMap(dataUrl: string) {
+  // Pasang peta dari gambar yang diunggah (PNG/JPG): area opaque/gelap jadi dinding.
+  public async applySvgMap(dataUrl: string, preferredRotation = 0) {
     if (this.phase !== "build") {
       this.onToast("⏳ Peta hanya bisa diganti di fase bangun (sebelum wave dimulai).");
       return;
@@ -4320,7 +4330,7 @@ export class GameEngine {
     this.onToast("⏳ Memproses peta dari gambar...");
     let result: Awaited<ReturnType<typeof loadSvgMap>> | null = null;
     try {
-      result = await loadSvgMap(dataUrl);
+      result = await loadSvgMap(dataUrl, preferredRotation);
     } catch {
       result = null;
     }
@@ -4341,7 +4351,7 @@ export class GameEngine {
     this.arenaHalfZ = result.grid.halfZ;
     this.fortressX = result.grid.endX - 6;
     try {
-      localStorage.setItem(SVG_STORAGE_KEY, JSON.stringify({ data: dataUrl }));
+      localStorage.setItem(SVG_STORAGE_KEY, JSON.stringify({ data: dataUrl, rotation: this.svgRotation }));
     } catch {
       // Peta tetap aktif di sesi ini walau storage penuh.
     }
@@ -4349,6 +4359,57 @@ export class GameEngine {
     this.playSound("place");
     const rotNote = result.rotation !== 0 ? `, diputar ${result.rotation}° agar jalur kiri→kanan tersambung` : "";
     this.onToast(`🗺️ PNG ${result.width}×${result.height}px dipasang: arena ${Math.round(result.grid.halfX * 2)}×${Math.round(result.grid.halfZ * 2)}m, area opaque = tembok, transparan = jalur orc${rotNote}.`);
+    this.emit();
+  }
+
+  // Putar peta PNG 90° searah jarum jam (jalur orc & collision dihitung ulang).
+  public rotateSvgMap() {
+    if (this.phase !== "build") {
+      this.onToast("⏳ Peta hanya bisa diputar di fase bangun.");
+      return;
+    }
+    if (!this.svgGrid || !this.svgImage || !this.svgDataUrl) {
+      this.onToast("Peta PNG belum aktif — unggah dulu lewat PETA DARI PNG.");
+      return;
+    }
+    const grid = this.svgGrid;
+    const ngw = grid.gh;
+    const ngh = grid.gw;
+    const walls = new Uint8Array(ngw * ngh);
+    for (let j = 0; j < grid.gh; j++) {
+      for (let i = 0; i < grid.gw; i++) {
+        walls[i * ngw + (ngw - 1 - j)] = grid.walls[j * grid.gw + i];
+      }
+    }
+    const rotated: CollisionGrid = {
+      walls,
+      gw: ngw,
+      gh: ngh,
+      halfX: grid.halfZ,
+      halfZ: grid.halfX,
+      startX: -(grid.halfZ + 12),
+      endX: grid.halfZ + 10,
+    };
+    const built = buildLanesFromWalls(rotated);
+    if (built.rejected) {
+      this.onToast("❌ Arah ini tidak punya jalur orc kiri→kanan. Coba putar lagi.");
+      return;
+    }
+    this.svgGrid = built.carved;
+    this.svgLanes = built.lanes;
+    this.trackLanes = built.lanes;
+    this.arenaHalfX = rotated.halfX;
+    this.arenaHalfZ = rotated.halfZ;
+    this.fortressX = rotated.endX - 6;
+    this.svgRotation = (this.svgRotation + 90) % 360;
+    this.rebuildTrack();
+    this.playSound("place");
+    try {
+      localStorage.setItem(SVG_STORAGE_KEY, JSON.stringify({ data: this.svgDataUrl, rotation: this.svgRotation }));
+    } catch {
+      // Tanpa storage, rotasi tetap berlaku di sesi ini.
+    }
+    this.onToast(`🔄 Peta diputar 90° (total ${this.svgRotation}°). Jalur orc & collision dihitung ulang.`);
     this.emit();
   }
 
@@ -4385,7 +4446,11 @@ export class GameEngine {
     if (this.phase === "build" && this.selectedType) {
       const capacity = this.towers.length < MAX_TOWERS &&
         (this.selectedType !== "barracks" || this.towers.filter((tower) => tower.type === "barracks").length < MAX_BARRACKS);
-      const valid = capacity && this.isValidPlacement(this.pointerPoint.x, this.pointerPoint.z) && this.scrap >= TOWERS[this.selectedType].cost;
+      const px = this.pointerPoint.x;
+      const pz = this.pointerPoint.z;
+      const valid = capacity &&
+        (this.isValidPlacement(px, pz) || (this.svgGrid !== null && this.isValidPlacement(px, pz, undefined, true))) &&
+        this.scrap >= TOWERS[this.selectedType].cost;
       this.ghostRing.scale.setScalar(TOWERS[this.selectedType].range);
       this.ghostRing.material.color.set(valid ? 0xf1dfaa : 0xf17769);
       this.ghostCore.material.color.set(valid ? 0xe7c574 : 0xf17769);
@@ -4521,8 +4586,8 @@ export class GameEngine {
         this.onToast("Batas pertahanan tercapai. Jual tower lain untuk membuka ruang.");
       } else if (this.scrap < config.cost) {
         this.onToast("Coin tidak cukup untuk tower ini.");
-      } else if (!this.isValidPlacement(x, z)) {
-        this.onToast("Bangun di tanah kosong, jauh dari jalur orc.");
+      } else if (!this.isValidPlacement(x, z) && !(this.svgGrid !== null && this.isValidPlacement(x, z, undefined, true))) {
+        this.onToast("Bangun di area transparan peta (bukan tembok/jalur orc).");
       } else {
         this.scrap -= config.cost;
         this.addTower(this.selectedType, x, z);
