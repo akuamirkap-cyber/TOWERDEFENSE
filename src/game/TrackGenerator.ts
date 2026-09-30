@@ -1,10 +1,10 @@
 import * as THREE from "three";
 
 export type TrackControl = readonly [number, number];
-export type EntrySide = "west" | "north" | "east" | "south";
+export type LaneId = "north" | "midNorth" | "midSouth" | "south";
 
 export interface RaidLane {
-  id: EntrySide;
+  id: LaneId;
   label: string;
   controls: TrackControl[];
 }
@@ -18,38 +18,44 @@ export const MAP_HALF_X = 80;
 export const MAP_HALF_Z = 60;
 export const VISUAL_HALF_X = MAP_HALF_X + 40;
 export const VISUAL_HALF_Z = MAP_HALF_Z + 35;
-export const ENTRY_ORDER: EntrySide[] = ["west", "north", "east", "south"];
+export const ENTRY_ORDER: LaneId[] = ["north", "midNorth", "midSouth", "south"];
 
-const LANE_LABELS: Record<EntrySide, string> = {
-  west: "BARAT",
+// Horde berbaris dari tepi barat (kiri layar) menuju benteng di tepi timur (kanan layar).
+export const LANE_START_X = -92;
+export const LANE_END_X = 90;
+export const FORTRESS_X = 84;
+
+const LANE_LABELS: Record<LaneId, string> = {
   north: "UTARA",
-  east: "TIMUR",
+  midNorth: "TENGAH ATAS",
+  midSouth: "TENGAH BAWAH",
   south: "SELATAN",
 };
 
-const DEFAULT_CONTROLS: Record<EntrySide, TrackControl[]> = {
-  west: [
-    [-72, -13], [-64, -13], [-58, -20], [-51, -29], [-42, -30], [-34, -26],
-    [-29, -18], [-24, -11], [-18, -5], [-12, -1], [-6, 0], [0, 0],
-  ],
-  north: [
-    [-12, -55], [-12, -48], [-18, -41], [-22, -33], [-18, -26],
-    [-13, -21], [-8, -16], [-5, -11], [-2, -6], [0, 0],
-  ],
-  east: [
-    [72, 13], [64, 13], [58, 20], [51, 29], [42, 30], [34, 26],
-    [29, 18], [24, 11], [18, 5], [12, 1], [6, 0], [0, 0],
-  ],
-  south: [
-    [12, 55], [12, 48], [18, 41], [22, 33], [18, 26],
-    [13, 21], [8, 16], [5, 11], [2, 6], [0, 0],
-  ],
-};
+interface LaneBand {
+  id: LaneId;
+  min: number;
+  max: number;
+  center: number;
+  endZ: number;
+}
+
+// Empat koridor paralel barat->timur; pita z dipisah agar jalan tidak bertumpuk.
+const LANE_BANDS: LaneBand[] = [
+  { id: "north", min: -48, max: -28, center: -38, endZ: -33 },
+  { id: "midNorth", min: -20, max: -9, center: -14.5, endZ: -13 },
+  { id: "midSouth", min: 9, max: 20, center: 14.5, endZ: 13 },
+  { id: "south", min: 28, max: 48, center: 38, endZ: 33 },
+];
 
 const NAMES = [
-  "FOUR WINDS", "CROSSWIND SIEGE", "THE OUTER MARCH", "BRAMBLE FRONT",
+  "FOUR CORRIDORS", "CROSSWIND SIEGE", "THE LONG MARCH", "BRAMBLE FRONT",
   "BORDERLAND RUSH", "WILDWOOD SIEGE", "ASHEN CROSSING", "WOLF'S ASSAULT",
 ];
+
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
+}
 
 function randomGenerator(seed: number) {
   let value = seed >>> 0;
@@ -68,37 +74,51 @@ function curveFor(controls: readonly TrackControl[]) {
   );
 }
 
-function controlsFor(seed: number, attempt: number, side: EntrySide): TrackControl[] {
-  const controls = DEFAULT_CONTROLS[side];
-  if (seed === 0) return controls.map(([x, z]) => [x, z]);
-  const random = randomGenerator(seed ^ Math.imul(attempt + 1, 0x9e3779b1) ^ (ENTRY_ORDER.indexOf(side) + 1) * 0x36b5a23);
-  const drift = (random() - 0.5) * 3.2;
-
-  return controls.map(([x, z], index) => {
-    if (index < 2 || index >= controls.length - 2) return [x, z];
-    const before = controls[index - 1];
-    const after = controls[index + 1];
-    const tangentX = after[0] - before[0];
-    const tangentZ = after[1] - before[1];
-    const tangentLength = Math.hypot(tangentX, tangentZ) || 1;
-    const envelope = Math.sin((index / (controls.length - 1)) * Math.PI);
-    const offset = ((random() - 0.5) * 5.4 + drift * 0.55) * envelope;
-    const forward = (random() - 0.5) * 1.8 * envelope;
+function controlsFor(seed: number, attempt: number, band: LaneBand): TrackControl[] {
+  if (seed === 0) {
+    // Peta klasik: empat koridor lurus panjang dari barat ke timur.
+    const z = band.center;
     return [
-      x - tangentZ / tangentLength * offset + tangentX / tangentLength * forward,
-      z + tangentX / tangentLength * offset + tangentZ / tangentLength * forward,
+      [LANE_START_X, z], [-70, z], [-50, z], [-30, z], [-10, z],
+      [10, z], [30, z], [50, z], [70, z], [LANE_END_X, z],
     ];
-  });
+  }
+  const random = randomGenerator(seed ^ Math.imul(attempt + 1, 0x9e3779b1) ^ (ENTRY_ORDER.indexOf(band.id) + 1) * 0x36b5a23);
+  const wander = 5 + random() * 6;
+  const jogChance = 0.26;
+  const startZ = clamp(band.center + (random() - 0.5) * (band.max - band.min) * 0.6, band.min, band.max);
+  const points: TrackControl[] = [
+    [LANE_START_X, startZ],
+    [LANE_START_X + 13, startZ],
+    [LANE_START_X + 26, startZ],
+  ];
+  let z = startZ;
+  let target = startZ;
+  let x = LANE_START_X + 38;
+  while (x < 68) {
+    if (random() < jogChance) {
+      // "Jog" Mendadak: lorong bergeser lalu lurus lagi, memberi kesan labirin.
+      target = clamp(target + (random() > 0.5 ? 1 : -1) * (7 + random() * 8), band.min + 1, band.max - 1);
+    } else {
+      target = clamp(target + (band.center - target) * 0.5 + (random() - 0.5) * wander * 1.7, band.min + 1, band.max - 1);
+    }
+    z = clamp(z + (target - z) * 0.7 + (random() - 0.5) * 2.4, band.min, band.max);
+    points.push([x, z]);
+    x += 11 + random() * 9;
+  }
+  const endZ = clamp(band.endZ + (random() - 0.5) * 5, band.min + 2, band.max - 2);
+  points.push([72, z], [78, (z + endZ) / 2], [84, endZ], [LANE_END_X, endZ]);
+  return points;
 }
 
 function validLane(controls: readonly TrackControl[]) {
   const curve = curveFor(controls);
   const length = curve.getLength();
-  if (length < 70 || length > 155) return null;
+  if (length < 150 || length > 290) return null;
   const samples = curve.getSpacedPoints(70);
   for (let i = 0; i < samples.length; i++) {
     const point = samples[i];
-    if (Math.abs(point.x) > MAP_HALF_X - 5 || Math.abs(point.z) > MAP_HALF_Z - 3) return null;
+    if (Math.abs(point.x) > LANE_END_X + 2 || Math.abs(point.z) > 54) return null;
     if (i > samples.length - 9) continue;
     for (let j = i + 7; j < samples.length - 8; j++) {
       const other = samples[j];
@@ -115,12 +135,10 @@ function validLayout(lanes: readonly RaidLane[]) {
     for (let b = a + 1; b < lanes.length; b++) {
       const first = inspected[a]!.samples;
       const second = inspected[b]!.samples;
-      // Distinct lanes can meet only in the inner keep approach.
+      // Koridor yang berbeda tidak boleh saling menumpuk.
       for (const p of first) {
-        if (Math.hypot(p.x, p.z) < 13) continue;
         for (const q of second) {
-          if (Math.hypot(q.x, q.z) < 13) continue;
-          if ((p.x - q.x) ** 2 + (p.z - q.z) ** 2 < 5.8 ** 2) return false;
+          if ((p.x - q.x) ** 2 + (p.z - q.z) ** 2 < 6 ** 2) return false;
         }
       }
     }
@@ -149,26 +167,72 @@ function coverageScore(lanes: readonly RaidLane[], towers: readonly TowerPositio
 }
 
 export function createRaidLanes(seed: number, towers: readonly TowerPosition[]): RaidLane[] {
-  const makeLanes = (attempt: number) => ENTRY_ORDER.map((id) => ({
-    id,
-    label: LANE_LABELS[id],
-    controls: controlsFor(seed, attempt, id),
+  const makeLanes = (attempt: number) => LANE_BANDS.map((band) => ({
+    id: band.id,
+    label: LANE_LABELS[band.id],
+    controls: controlsFor(seed, attempt, band),
   }));
   if (seed === 0) return makeLanes(0);
 
   let best: RaidLane[] | null = null;
   let bestScore = -Infinity;
-  for (let attempt = 0; attempt < 22; attempt++) {
+  for (let attempt = 0; attempt < 30; attempt++) {
     const lanes = makeLanes(attempt);
     if (!validLayout(lanes)) continue;
     const totalLength = lanes.reduce((sum, lane) => sum + curveFor(lane.controls).getLength(), 0);
-    const score = totalLength * 0.12 + coverageScore(lanes, towers);
+    const score = totalLength * 0.1 + coverageScore(lanes, towers);
     if (score > bestScore) {
       bestScore = score;
       best = lanes;
     }
   }
+  // Darurat: koridor lurus yang selalu valid.
   return best ?? makeLanes(0);
+}
+
+// Jalan dekoratif buntu agar peta terlihat seperti labirin di screenshot:
+// orc tetap hanya berjalan di RaidLane, sisanya hiasan jalan.
+export function createDecorRoads(seed: number, lanes: readonly RaidLane[]): TrackControl[][] {
+  if (seed === 0) return [];
+  const random = randomGenerator(seed ^ 0x5f3759df);
+  const roads: TrackControl[][] = [];
+  const clearOfFortress = (x: number, z: number) => (x - FORTRESS_X) ** 2 + z * z >= 13 ** 2;
+
+  for (const lane of lanes) {
+    const branches = 2 + Math.floor(random() * 2);
+    for (let branch = 0; branch < branches; branch++) {
+      const index = 2 + Math.floor(random() * Math.max(1, lane.controls.length - 4));
+      const [px, pz] = lane.controls[index];
+      let dir = random() > 0.5 ? 1 : -1;
+      if (!clearOfFortress(px, pz + dir * 12)) dir = -dir;
+      if (!clearOfFortress(px, pz + dir * 12)) continue;
+      const reach = 9 + random() * 9;
+      const run = 13 + random() * 26;
+      const runDir = random() > 0.5 ? 1 : -1;
+      const baseZ = pz + dir * reach;
+      const tailZ = clamp(baseZ + (random() - 0.5) * 8, -84, 84);
+      const points: TrackControl[] = [
+        [px, pz],
+        [px + runDir * 2, pz + dir * reach * 0.5],
+        [clamp(px + runDir * run * 0.4, -104, 104), baseZ],
+        [clamp(px + runDir * run * 0.8, -104, 104), baseZ],
+        [clamp(px + runDir * run, -104, 104), tailZ],
+      ];
+      if (points.every(([x, z]) => clearOfFortress(x, z) && Math.abs(z) < 86 && Math.abs(x) < 106)) roads.push(points);
+    }
+  }
+
+  const stubs = 3 + Math.floor(random() * 3);
+  for (let stub = 0; stub < stubs; stub++) {
+    const fromNorth = random() > 0.5;
+    const x = clamp(-64 + random() * 128, -100, 66);
+    const edgeZ = fromNorth ? -60 - random() * 20 : 60 + random() * 20;
+    const depth = 14 + random() * 18;
+    const tipZ = fromNorth ? edgeZ + depth : edgeZ - depth;
+    if (!clearOfFortress(x, tipZ)) continue;
+    roads.push([[x, edgeZ], [x, (edgeZ + tipZ) / 2], [x + (random() - 0.5) * 8, tipZ]]);
+  }
+  return roads;
 }
 
 export function isValidRaidLanes(value: unknown): value is RaidLane[] {
@@ -176,20 +240,18 @@ export function isValidRaidLanes(value: unknown): value is RaidLane[] {
   const lanes: RaidLane[] = [];
   for (let index = 0; index < ENTRY_ORDER.length; index++) {
     const candidate = value[index] as Partial<RaidLane> | null;
-    const side = ENTRY_ORDER[index];
-    if (!candidate || candidate.id !== side || !Array.isArray(candidate.controls)) return false;
+    const id = ENTRY_ORDER[index];
+    if (!candidate || candidate.id !== id || !Array.isArray(candidate.controls)) return false;
     const controls = candidate.controls;
-    const reference = DEFAULT_CONTROLS[side];
-    if (controls.length !== reference.length || !controls.every((point) => Array.isArray(point) && point.length === 2 &&
+    if (controls.length < 8 || controls.length > 48) return false;
+    if (!controls.every((point) => Array.isArray(point) && point.length === 2 &&
       point.every((coordinate) => typeof coordinate === "number" && Number.isFinite(coordinate)))) return false;
-    if (controls[0][0] !== reference[0][0] || controls[0][1] !== reference[0][1]) return false;
-    const end = controls[controls.length - 1];
-    if (end[0] !== 0 || end[1] !== 0) return false;
-    lanes.push({ id: side, label: LANE_LABELS[side], controls });
+    if (controls[0][0] !== LANE_START_X || controls[controls.length - 1][0] !== LANE_END_X) return false;
+    lanes.push({ id, label: LANE_LABELS[id], controls });
   }
   return validLayout(lanes);
 }
 
 export function trackName(seed: number) {
-  return seed === 0 ? "FOUR FRONTS" : NAMES[seed % NAMES.length];
+  return seed === 0 ? "FOUR CORRIDORS" : NAMES[seed % NAMES.length];
 }
